@@ -450,8 +450,10 @@ function M._save_comment_buffer(buf)
   M._comment_ctx[buf] = nil
   pcall(function() vim.bo[buf].modified = false end)
   -- Defer cleanup so we're not mutating window/buffer state inside a
-  -- BufWriteCmd autocmd.
+  -- BufWriteCmd autocmd. stopinsert ensures the diff buffer we return to
+  -- doesn't get keystrokes as insert-mode input.
   vim.schedule(function()
+    vim.cmd("stopinsert")
     if ctx.win and vim.api.nvim_win_is_valid(ctx.win) then
       pcall(vim.api.nvim_win_close, ctx.win, true)
     end
@@ -468,6 +470,7 @@ end
 function M._cancel_comment_buffer(buf)
   local ctx = M._comment_ctx[buf]
   M._comment_ctx[buf] = nil
+  vim.cmd("stopinsert")
   if ctx and ctx.win and vim.api.nvim_win_is_valid(ctx.win) then
     pcall(vim.api.nvim_win_close, ctx.win, true)
   end

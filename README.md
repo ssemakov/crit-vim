@@ -54,7 +54,7 @@ crit-vim doctor
 
 The output should list your nvim's socket under `registry`.
 
-Requires: Neovim 0.10+, `git`, `uuidgen`, `bash`, `jq` *or* `python3`.
+Requires: Neovim 0.10+, `git`, `uuidgen`, `bash`, `jq` _or_ `python3`.
 
 ## Usage
 
@@ -66,7 +66,7 @@ You need two things:
    anywhere with `$PATH` set: a sibling tmux pane, a separate terminal window,
    an IDE terminal, `:terminal` inside the same nvim, an SSH session sharing
    the socket — anything that resolves to the same `git rev-parse
-   --show-toplevel` will find the right nvim via the per-repo registry.
+--show-toplevel` will find the right nvim via the per-repo registry.
 
 In the shell:
 
@@ -82,15 +82,15 @@ tabs with `gt`/`gT`, or `:CritFiles` for a picker.
 
 Pick a range, then drop into a floating comment buffer:
 
-| To comment on... | Do this |
-|---|---|
-| the current line | `<leader>cc` |
-| a paragraph | `<leader>cap` (operator + text-object) |
-| this line and the next 4 | `<leader>c4j` (operator + count + motion) |
-| down to the next blank line | `<leader>c}` |
-| inside quotes / brackets / a tag | `<leader>ci"` / `<leader>ci(` / `<leader>cit` |
-| an arbitrary visual selection | `V` → move → `<leader>c` (linewise) or `v` → move → `<leader>c` |
-| an explicit line range | `:42,55CritComment` |
+| To comment on...                 | Do this                                                         |
+| -------------------------------- | --------------------------------------------------------------- |
+| the current line                 | `<leader>cc`                                                    |
+| a paragraph                      | `<leader>cap` (operator + text-object)                          |
+| this line and the next 4         | `<leader>c4j` (operator + count + motion)                       |
+| down to the next blank line      | `<leader>c}`                                                    |
+| inside quotes / brackets / a tag | `<leader>ci"` / `<leader>ci(` / `<leader>cit`                   |
+| an arbitrary visual selection    | `V` → move → `<leader>c` (linewise) or `v` → move → `<leader>c` |
+| an explicit line range           | `:42,55CritComment`                                             |
 
 Anywhere you'd use a vim motion or text-object after `d`/`y`/`c`, you can use
 it after `<leader>c`. The saved comment is anchored to the **line range** the
@@ -99,20 +99,20 @@ preserved in the comment's `quote` field.
 
 Inside the floating buffer (real vim — operators, registers, clipboard, etc.):
 
-| Keys / Command | Behaviour |
-|---|---|
+| Keys / Command                      | Behaviour                  |
+| ----------------------------------- | -------------------------- |
 | `<C-s>` (normal+insert), `:w`, `ZZ` | save the comment and close |
-| `q` (normal), `:q!` | cancel without saving |
+| `q` (normal), `:q!`                 | cancel without saving      |
 
 ### Managing comments
 
-| Command | Behaviour |
-|---|---|
-| `:CritEdit` | edit comment under cursor |
+| Command       | Behaviour                                 |
+| ------------- | ----------------------------------------- |
+| `:CritEdit`   | edit comment under cursor                 |
 | `:CritDelete` | delete comment under cursor (prompts y/N) |
-| `:CritList` | quickfix list of all comments |
-| `:CritFiles` | floating picker: jump to a file's tab |
-| `:CritReopen` | rebuild diff tabs after `<C-w>o` etc. |
+| `:CritList`   | quickfix list of all comments             |
+| `:CritFiles`  | floating picker: jump to a file's tab     |
+| `:CritReopen` | rebuild diff tabs after `<C-w>o` etc.     |
 
 ### Submitting the review
 
@@ -133,11 +133,11 @@ vim.keymap.set("n", "<leader>cX", "<cmd>CritDelete<cr>")
 
 ## CLI commands
 
-| Command | What it does |
-|---|---|
-| `crit-vim review [--base REF]` | open a review and block on `:CritFinish` |
-| `crit-vim status` | print the JSON of the most recently finished review |
-| `crit-vim doctor` | diagnose nvim socket discovery |
+| Command                        | What it does                                        |
+| ------------------------------ | --------------------------------------------------- |
+| `crit-vim review [--base REF]` | open a review and block on `:CritFinish`            |
+| `crit-vim status`              | print the JSON of the most recently finished review |
+| `crit-vim doctor`              | diagnose nvim socket discovery                      |
 
 ## Troubleshooting
 
@@ -188,8 +188,8 @@ Kept shape-compatible with upstream `crit status --code`:
           "quote": "for {",
           "anchor": {
             "before": ["...", "...", "..."],
-            "body":   ["for {"],
-            "after":  ["...", "...", "..."],
+            "body": ["for {"],
+            "after": ["...", "...", "..."],
             "start_line": 42,
             "end_line": 42
           }
@@ -205,15 +205,6 @@ We own this file (in `$TMPDIR/crit-vim/<sid>/comments.json`). When we later
 switch to the upstream daemon, we replace two functions in `lua/crit-vim/init.lua`
 (`_append_comment` and the reads in `_refresh_signs_for_file`) with calls to
 `crit comment --json` / `crit status --json`. The schema stays put.
-
-## Files
-
-```
-bin/crit-vim                 # ~280 LOC bash CLI
-lua/crit-vim/init.lua        # ~350 LOC plugin core
-plugin/crit-vim.lua          # ~60 LOC entry: commands, keymaps, autocmds
-test/smoke.sh                # end-to-end loop test
-```
 
 ## Smoke test
 
