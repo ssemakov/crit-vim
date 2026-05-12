@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# crit-vim — minimal review CLI
+#
+# Subcommands:
+#   review [--base REF] [--wait|--no-wait] [--timeout SECONDS] [--socket PATH] [--code]
+#       Open a review of `git diff <base>` in the user's running nvim and
+#       (by default) block until :CritFinish or :CritCancel.
+#       On success, prints crit-shape JSON to stdout and exits 0.
+#       Exit codes: 0 ok, 1 cancelled, 2 setup error, 124 timeout.
+#
+#   status [--code]
+#       Print the JSON of the most recently finished review.
+#
+#   doctor
+#       Diagnose nvim socket discovery.
+
+set -euo pipefail
+
+# ---------- helpers ----------
+
+die() { echo "crit-vim: $*" >&2; exit 2; }
+
+json_str() {
+  # JSON-encode stdin as a string literal (uses jq if available, else python3).
+  if command -v jq >/dev/null 2>&1; then
+    jq -Rs .
+  else
+    python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))'
+  fi
+}
+
+sha256_hex() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | cut -d' ' -f1
+  else
+    sha256sum | cut -d' ' -f1
+  fi
+}
+
+repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null || return 1
+}
+
+socket_registry_path() {
+  local repo="$1"
+  local sha
+  sha=$(printf '%s' "$repo" | sha256_hex)
+  printf '%s' "$HOME/.crit-vim/sockets/$sha"
+}
+
+find_socket() {
+  # Resolution order: --socket > $CRIT_VIM_SOCKET > $NVIM > per-repo registry.
+  if [[ -n "${FORCE_SOCKET:-}" ]]; then printf '%s\n' "$FORCE_SOCKET"; return 0; fi
+  if [[ -n "${CRIT_VIM_SOCKET:-}" ]]; then printf '%s\n' "$CRIT_VIM_SOCKET"; return 0; fi
+  if [[ -n "${NVIM:-}" ]]; then printf '%s\n' "$NVIM"; return 0; fi
+  local repo
+  repo=$(repo_root) || return 1
+  local reg
+  reg=$(socket_registry_path "$repo")
+  if [[ -f "$reg" ]]; then
+    local s
+    s=$(cat "$reg")
+    if [[ -n "$s" ]]; then
+      printf '%s\n' "$s"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+nvim_reachable() {
+  nvim --server "$1" --remote-expr '1' >/dev/null 2>&1
+}
+
+# ---------- review ----------
+
+cmd_review() {
+  local base="HEAD"
+  local wait_for_finish=1
+  local timeout=14400
+  FORCE_SOCKET="${FORCE_SOCKET:-}"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --base) base="$2"; shift 2 ;;
+      --base=*) base="${1#*=}"; shift ;;
+      --wait) wait_for_finish=1; shift ;;
+      --no-wait) wait_for_finish=0; shift ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      --timeout=*) timeout="${1#*=}"; shift ;;
+      --socket) FORCE_SOCKET="$2"; shift 2 ;;
+      --socket=*) FORCE_SOCKET="${1#*=}"; shift ;;
+      --code|--json) shift ;;  # accepted for skill compatibility; always crit-shape
+      -h|--help) cat <<EOF
+usage: crit-vim review [--base REF] [--wait|--no-wait] [--timeout SECS] [--socket PATH]
+EOF
+        return 0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  local repo
+  repo=$(repo_root) || die "not in a git repo"
+
+  # Enumerate changed files vs base.
+  local files_json="["
+  local sep=""
+  local any=0
+  while IFS=$'\t' read -r status path new_path; do
+    [[ -z "${status:-}" ]] && continue
+    any=1
+    local first="${status:0:1}"
+    local st
+    case "$first" in
+      A) st="added" ;;
+      D) st="deleted" ;;
+      M) st="modified" ;;
+      R) st="renamed" ;;
+      C) st="copied" ;;
+      T) st="modified" ;;
+      *) st="modified" ;;
+    esac
+    if [[ "$st" == "renamed" || "$st" == "copied" ]]; then
+      local p_enc np_enc op_enc
+      np_enc=$(printf '%s' "$new_path" | json_str)
+      op_enc=$(printf '%s' "$path" | json_str)
+      files_json+="${sep}{\"path\":${np_enc},\"status\":\"${st}\",\"old_path\":${op_enc}}"
+    else
+      local p_enc
+      p_enc=$(printf '%s' "$path" | json_str)
+      files_json+="${sep}{\"path\":${p_enc},\"status\":\"${st}\"}"
+    fi
+    sep=","
+  # Tracked diffs + untracked files (the agent's new files, which would
+  # otherwise be invisible until `git add`). Both streams are name-status
+  # formatted.
+  done < <({ git -C "$repo" diff --name-status "$base"; git -C "$repo" ls-files --others --exclude-standard | awk '{print "A\t" $0}'; })
+  files_json+="]"
+
+  if [[ "$any" -eq 0 ]]; then
+    die "no changes vs $base"
+  fi
+
+  # Session directory.
+  local tmp="${TMPDIR:-/tmp}"
+  tmp="${tmp%/}"
+  local sid
+  sid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+  local sdir="$tmp/crit-vim/$sid"
+  mkdir -p "$sdir"
+
+  # Write meta.json.
+  local repo_enc base_enc sid_enc
+  repo_enc=$(printf '%s' "$repo" | json_str)
+  base_enc=$(printf '%s' "$base" | json_str)
+  sid_enc=$(printf '%s' "$sid" | json_str)
+  printf '{"session_id":%s,"repo_root":%s,"base":%s,"files":%s}\n' \
+    "$sid_enc" "$repo_enc" "$base_enc" "$files_json" > "$sdir/meta.json"
+
+  # Initialise empty crit-shape comments file.
+  printf '{"files":{},"review_comments":[]}\n' > "$sdir/comments.json"
+
+  # FIFO that vim signals when the review is done.
+  mkfifo "$sdir/done"
+
+  # Find the user's nvim.
+  local sock
+  if ! sock=$(find_socket); then
+    rm -rf "$sdir"
+    cat >&2 <<EOM
+crit-vim: cannot find a running nvim with the crit-vim plugin loaded.
+  Tried: \$NVIM, \$CRIT_VIM_SOCKET, ~/.crit-vim/sockets/<sha(repo)>
+  Run 'crit-vim doctor' for details, or:
+    - start nvim in this repo with the crit-vim plugin loaded, or
+    - export CRIT_VIM_SOCKET=/path/to/nvim.sock
+EOM
+    exit 2
+  fi
+
+  if ! nvim_reachable "$sock"; then
+    rm -rf "$sdir"
+    die "nvim socket is unreachable: $sock"
+  fi
+
+  # Open the FIFO read-end first so the lua writer doesn't block.
+  exec 3<>"$sdir/done"
+
+  # Tell vim to start the review. luaeval's _A is the bash-supplied arg.
+  local sdir_lua_arg
+  sdir_lua_arg=$(printf '%s' "$sdir" | sed "s/'/\\\\'/g")
+  if ! nvim --server "$sock" --remote-expr \
+        "luaeval('require\"crit-vim\".start_review(_A)', '$sdir_lua_arg')" \
+        >/dev/null 2>"$sdir/nvim.err"; then
+    echo "crit-vim: failed to start review in nvim" >&2
+    cat "$sdir/nvim.err" >&2 || true
+    exec 3<&-
+    exit 2
+  fi
+
+  if [[ "$wait_for_finish" -eq 0 ]]; then
+    exec 3<&-
+    printf '%s\n' "$sdir"
+    return 0
+  fi
+
+  # Block until vim signals.
+  if ! read -r -t "$timeout" -u 3 _line; then
+    echo "crit-vim: timed out after ${timeout}s" >&2
+    nvim --server "$sock" --remote-expr \
+      'luaeval("require\"crit-vim\".cancel()")' >/dev/null 2>&1 || true
+    exec 3<&-
+    exit 124
+  fi
+  exec 3<&-
+
+  local result="ok"
+  [[ -f "$sdir/result" ]] && result=$(cat "$sdir/result")
+
+  if [[ "$result" == "cancel" ]]; then
+    echo "crit-vim: review cancelled" >&2
+    exit 1
+  fi
+  if [[ "$result" == "error" ]]; then
+    echo "crit-vim: review errored in nvim" >&2
+    [[ -f "$sdir/error" ]] && cat "$sdir/error" >&2
+    exit 2
+  fi
+
+  # Remember this session for `crit-vim status`.
+  mkdir -p "$HOME/.crit-vim"
+  printf '%s\n' "$sdir" > "$HOME/.crit-vim/last-finished"
+
+  cat "$sdir/comments.json"
+}
+
+# ---------- status ----------
+
+cmd_status() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --code|--json) shift ;;
+      -h|--help) echo "usage: crit-vim status [--code]"; return 0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  local last="$HOME/.crit-vim/last-finished"
+  [[ -f "$last" ]] || die "no finished review found"
+  local dir
+  dir=$(cat "$last")
+  [[ -f "$dir/comments.json" ]] || die "stale pointer: $dir"
+  cat "$dir/comments.json"
+}
+
+# ---------- doctor ----------
+
+cmd_doctor() {
+  echo "crit-vim doctor"
+  echo "  \$NVIM=${NVIM:-(unset)}"
+  echo "  \$CRIT_VIM_SOCKET=${CRIT_VIM_SOCKET:-(unset)}"
+  local repo
+  if repo=$(repo_root); then
+    echo "  repo=$repo"
+    local reg
+    reg=$(socket_registry_path "$repo")
+    if [[ -f "$reg" ]]; then
+      local s
+      s=$(cat "$reg")
+      echo "  registry=$reg"
+      echo "    socket=$s"
+      if nvim_reachable "$s"; then
+        echo "    reachable=yes"
+      else
+        echo "    reachable=NO (stale; will be ignored)"
+      fi
+    else
+      echo "  registry=(none for this repo)"
+    fi
+  else
+    echo "  repo=(not in a git repo)"
+  fi
+  local resolved
+  if resolved=$(find_socket); then
+    echo "  → would use: $resolved"
+    if nvim_reachable "$resolved"; then
+      echo "    reachable: yes"
+    else
+      echo "    reachable: NO"
+    fi
+  else
+    echo "  → no nvim found; set CRIT_VIM_SOCKET or open nvim in this repo"
+  fi
+}
+
+# ---------- dispatch ----------
+
+main() {
+  local cmd="${1:-}"
+  [[ $# -gt 0 ]] && shift || true
+  case "$cmd" in
+    review) cmd_review "$@" ;;
+    status) cmd_status "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    -h|--help|help|"")
+      cat <<EOF
+usage: crit-vim <command> [options]
+
+Commands:
+  review   open a review of \`git diff <base>\` in the user's running nvim
+  status   print the JSON of the most recently finished review
+  doctor   diagnose nvim socket discovery
+EOF
+      ;;
+    *) die "unknown command: $cmd (try 'crit-vim --help')" ;;
+  esac
+}
+
+main "$@"
