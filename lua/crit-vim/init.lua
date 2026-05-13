@@ -127,27 +127,42 @@ end
 
 local function open_file_diff(file_info, base, repo)
   vim.cmd("tabnew")
+
+  -- Added or deleted: just one window — there's nothing to diff against on
+  -- the missing side. Comments use whichever side has content.
+  if file_info.status == "added" then
+    local buf = vim.api.nvim_get_current_buf()
+    vim.api.nvim_buf_set_name(buf, file_info.path .. " [new]")
+    fill_buffer(buf, read_working_file(repo, file_info.path))
+    set_review_buffer(buf, file_info.path, "right", file_info.path)
+    return { left = buf, right = buf, file = file_info.path,
+             tab = vim.api.nvim_get_current_tabpage() }
+  end
+  if file_info.status == "deleted" then
+    local buf = vim.api.nvim_get_current_buf()
+    vim.api.nvim_buf_set_name(buf, file_info.path .. " [deleted]")
+    fill_buffer(buf, git_show(repo, base, file_info.old_path or file_info.path))
+    set_review_buffer(buf, file_info.path, "left", file_info.path)
+    return { left = buf, right = buf, file = file_info.path,
+             tab = vim.api.nvim_get_current_tabpage() }
+  end
+
+  -- Modified / renamed: side-by-side diff.
   local right_buf = vim.api.nvim_get_current_buf()
   vim.api.nvim_buf_set_name(right_buf, file_info.path .. " [working]")
-  if file_info.status ~= "deleted" then
-    fill_buffer(right_buf, read_working_file(repo, file_info.path))
-  else
-    fill_buffer(right_buf, {})
-  end
+  fill_buffer(right_buf, read_working_file(repo, file_info.path))
   set_review_buffer(right_buf, file_info.path, "right", file_info.path)
   vim.cmd("diffthis")
 
   vim.cmd("leftabove vsplit | enew")
   local left_buf = vim.api.nvim_get_current_buf()
   vim.api.nvim_buf_set_name(left_buf, file_info.path .. " [" .. base .. "]")
-  if file_info.status ~= "added" then
-    local src_path = file_info.old_path or file_info.path
-    fill_buffer(left_buf, git_show(repo, base, src_path))
-  else
-    fill_buffer(left_buf, {})
-  end
+  fill_buffer(left_buf, git_show(repo, base, file_info.old_path or file_info.path))
   set_review_buffer(left_buf, file_info.path, "left", file_info.path)
   vim.cmd("diffthis")
+
+  -- Land on the right (working-tree) side — that's where review focus is.
+  vim.cmd("wincmd l")
 
   return {
     left = left_buf,
@@ -674,8 +689,11 @@ function M._refresh_signs_for_file(file)
   local bufs = M.session and M.session.file_bufs[file]
   if not bufs then return end
 
+  -- For added/deleted files left==right; dedupe so we don't unplace twice.
+  local seen = {}
   for _, buf in ipairs({ bufs.left, bufs.right }) do
-    if vim.api.nvim_buf_is_valid(buf) then
+    if not seen[buf] and vim.api.nvim_buf_is_valid(buf) then
+      seen[buf] = true
       vim.fn.sign_unplace(SIGN_GROUP, { buffer = buf })
       vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
     end
