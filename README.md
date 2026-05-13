@@ -75,8 +75,11 @@ crit-vim review --base HEAD
 ```
 
 That blocks. In nvim, **one diff tab opens per changed file** (tracked
-modifications + untracked-but-present files, treated as added). Navigate
-tabs with `gt`/`gT`, or `:CritFiles` for a picker.
+modifications + untracked-but-present files, treated as added). A persistent
+**sidebar** appears at the left of every review tab showing the file list with
+comment counts — `<CR>` on a row jumps to that file's diff, `q` closes the
+sidebar (`:CritSidebar` to reopen), `R` refreshes. The cursor in the sidebar
+auto-tracks the current tab. `gt`/`gT` also work for plain tab nav.
 
 ### Authoring comments
 
@@ -111,8 +114,8 @@ Inside the floating buffer (real vim — operators, registers, clipboard, etc.):
 | `:CritEdit`   | edit comment under cursor                 |
 | `:CritDelete` | delete comment under cursor (prompts y/N) |
 | `:CritList`   | quickfix list of all comments             |
-| `:CritFiles`  | floating picker: jump to a file's tab     |
-| `:CritReopen` | rebuild diff tabs after `<C-w>o` etc.     |
+| `:CritSidebar` | toggle the file list sidebar in this tab  |
+| `:CritReopen`  | rebuild diff tabs + sidebars (after `<C-w>o` etc.) |
 
 ### Submitting the review
 

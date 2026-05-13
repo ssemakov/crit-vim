@@ -20,6 +20,13 @@ vim.api.nvim_create_autocmd("DirChanged", {
   callback = function() crit.register_socket() end,
 })
 
+-- Highlight the current tab's file in the sidebar whenever the user
+-- switches tabs.
+vim.api.nvim_create_autocmd("TabEnter", {
+  group = group,
+  callback = function() crit._reposition_sidebar_cursor() end,
+})
+
 -- ---------- commands ----------
 -- Ex commands are the canonical interface; pick whatever <leader> bindings
 -- you like on top of them. They are safe from which-key/global collisions.
@@ -38,11 +45,11 @@ vim.api.nvim_create_user_command("CritEdit", function() crit.edit_at_cursor() en
 vim.api.nvim_create_user_command("CritDelete", function() crit.delete_at_cursor() end,
   { desc = "crit-vim: delete comment under cursor" })
 
-vim.api.nvim_create_user_command("CritFiles", function() crit.files_picker() end,
-  { desc = "crit-vim: list review files (Enter to jump)" })
-
 vim.api.nvim_create_user_command("CritReopen", function() crit.reopen() end,
   { desc = "crit-vim: rebuild diff tabs (after <C-w>o etc.)" })
+
+vim.api.nvim_create_user_command("CritSidebar", function() crit.sidebar_toggle() end,
+  { desc = "crit-vim: toggle file sidebar in current tab" })
 
 vim.api.nvim_create_user_command("CritList", function() crit.list() end,
   { desc = "crit-vim: show comments in quickfix" })

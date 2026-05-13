@@ -172,6 +172,179 @@ local function open_file_diff(file_info, base, repo)
   }
 end
 
+-- ---------- sidebar ----------
+-- A persistent file list pinned to the leftmost column of every review tab.
+-- One shared buffer rendered in N windows (one per tab). cursorline is
+-- window-local, so each tab highlights its own current file independently.
+
+local SIDEBAR_WIDTH = 38
+local SIDEBAR_HEADER_ROWS = 2  -- title + blank
+local SIDEBAR_FT = "critvim_sidebar"
+
+local function status_glyph(st)
+  if st == "modified" then return "M" end
+  if st == "added"    then return "A" end
+  if st == "deleted"  then return "D" end
+  if st == "renamed"  then return "R" end
+  if st == "copied"   then return "C" end
+  return "?"
+end
+
+local function sidebar_lines()
+  local data = read_json(M.session.dir .. "/comments.json") or { files = {} }
+  local total = 0
+  local rows = { "", "" }  -- header filled in last
+  local path_w = SIDEBAR_WIDTH - 10
+  for _, fi in ipairs(M.session.files) do
+    local fdata = data.files and data.files[fi.path]
+    local n = (fdata and #(fdata.comments or {})) or 0
+    total = total + n
+    local p = fi.path
+    if #p > path_w then p = "…" .. p:sub(-(path_w - 1)) end
+    local count = n > 0 and string.format("[%d]", n) or ""
+    rows[#rows + 1] = string.format(" %s  %-" .. path_w .. "s %s",
+      status_glyph(fi.status), p, count)
+  end
+  rows[1] = string.format("crit-vim — %d file%s · %d comment%s",
+    #M.session.files, #M.session.files == 1 and "" or "s",
+    total, total == 1 and "" or "s")
+  return rows
+end
+
+local function ensure_sidebar_buf()
+  local existing = M.session and M.session.sidebar_buf
+  if existing and vim.api.nvim_buf_is_valid(existing) then return existing end
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(buf, "critvim://sidebar")
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "hide"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].buflisted = false
+  vim.bo[buf].filetype = SIDEBAR_FT
+  vim.bo[buf].modifiable = false
+
+  vim.keymap.set("n", "<CR>", function() M._sidebar_jump() end,
+    { buffer = buf, desc = "crit-vim: jump to file" })
+  vim.keymap.set("n", "<2-LeftMouse>", function() M._sidebar_jump() end,
+    { buffer = buf })
+  vim.keymap.set("n", "q", function() M.sidebar_toggle() end,
+    { buffer = buf, desc = "crit-vim: close sidebar" })
+  vim.keymap.set("n", "R", function() M.render_sidebar() end,
+    { buffer = buf, desc = "crit-vim: refresh sidebar" })
+
+  M.session.sidebar_buf = buf
+  return buf
+end
+
+local function file_index_for_tab(tab)
+  if not M.session then return nil end
+  for i, fi in ipairs(M.session.files) do
+    local bufs = M.session.file_bufs[fi.path]
+    if bufs and bufs.tab == tab then return i, fi end
+  end
+  return nil
+end
+
+function M._reposition_sidebar_cursor()
+  if not M.session then return end
+  local tab = vim.api.nvim_get_current_tabpage()
+  local idx = file_index_for_tab(tab)
+  if not idx then return end
+  local row = SIDEBAR_HEADER_ROWS + idx
+  for _, bufs in pairs(M.session.file_bufs) do
+    if bufs.tab == tab and bufs.sidebar_win
+       and vim.api.nvim_win_is_valid(bufs.sidebar_win) then
+      pcall(vim.api.nvim_win_set_cursor, bufs.sidebar_win, { row, 0 })
+      return
+    end
+  end
+end
+
+function M.render_sidebar()
+  if not M.session or not M.session.sidebar_buf then return end
+  local buf = M.session.sidebar_buf
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  local lines = sidebar_lines()
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  M._reposition_sidebar_cursor()
+end
+
+function M._sidebar_jump()
+  if not M.session then return end
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local idx = row - SIDEBAR_HEADER_ROWS
+  local fi = M.session.files[idx]
+  if not fi then return end
+  local bufs = M.session.file_bufs[fi.path]
+  if not bufs or not bufs.tab or not vim.api.nvim_tabpage_is_valid(bufs.tab) then return end
+  vim.api.nvim_set_current_tabpage(bufs.tab)
+  -- Land in the rightmost diff window of the target tab.
+  local target
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(bufs.tab)) do
+    if w ~= bufs.sidebar_win then target = w end  -- last non-sidebar wins
+  end
+  if target then pcall(vim.api.nvim_set_current_win, target) end
+end
+
+local function open_sidebar_in_current_tab()
+  if not M.session then return end
+  ensure_sidebar_buf()
+  local tab = vim.api.nvim_get_current_tabpage()
+
+  -- Skip if a sidebar window already exists for this tab.
+  for _, bufs in pairs(M.session.file_bufs) do
+    if bufs.tab == tab and bufs.sidebar_win
+       and vim.api.nvim_win_is_valid(bufs.sidebar_win) then
+      return
+    end
+  end
+
+  vim.cmd("topleft " .. SIDEBAR_WIDTH .. "vsplit")
+  vim.cmd("buffer " .. M.session.sidebar_buf)
+  local win = vim.api.nvim_get_current_win()
+  vim.wo[win].wrap = false
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+  vim.wo[win].signcolumn = "no"
+  vim.wo[win].cursorline = true
+  vim.wo[win].winfixwidth = true
+  vim.wo[win].list = false
+
+  -- Record the sidebar window against this tab's file.
+  for _, bufs in pairs(M.session.file_bufs) do
+    if bufs.tab == tab then bufs.sidebar_win = win end
+  end
+  -- Focus stays on the sidebar; that's the navigation surface.
+end
+
+function M.sidebar_toggle()
+  if not M.session then
+    vim.notify("crit-vim: no active review", vim.log.levels.WARN)
+    return
+  end
+  local tab = vim.api.nvim_get_current_tabpage()
+  local existing
+  for _, bufs in pairs(M.session.file_bufs) do
+    if bufs.tab == tab and bufs.sidebar_win
+       and vim.api.nvim_win_is_valid(bufs.sidebar_win) then
+      existing = bufs.sidebar_win
+      break
+    end
+  end
+  if existing then
+    pcall(vim.api.nvim_win_close, existing, true)
+    for _, bufs in pairs(M.session.file_bufs) do
+      if bufs.sidebar_win == existing then bufs.sidebar_win = nil end
+    end
+  else
+    open_sidebar_in_current_tab()
+    M._reposition_sidebar_cursor()
+  end
+end
+
 -- ---------- session lifecycle ----------
 
 -- Forward-declared; defined below.
@@ -205,6 +378,7 @@ function M.start_review(session_dir)
       local bufs = open_file_diff(file_info, meta.base, meta.repo_root)
       M.session.file_bufs[file_info.path] = bufs
       if i == 1 then M.session.first_tab = bufs.tab end
+      open_sidebar_in_current_tab()
     end
 
     if M.session.first_tab then
@@ -212,6 +386,7 @@ function M.start_review(session_dir)
     end
 
     M.render_all_comments()
+    M.render_sidebar()
   end)
 
   if not ok then
@@ -234,9 +409,17 @@ end
 close_session = function(result)
   if not M.session then return end
   local dir = M.session.dir
+  if M.session.sidebar_buf and vim.api.nvim_buf_is_valid(M.session.sidebar_buf) then
+    pcall(vim.api.nvim_buf_delete, M.session.sidebar_buf, { force = true })
+  end
+  local seen = {}
   for _, bufs in pairs(M.session.file_bufs) do
-    pcall(vim.api.nvim_buf_delete, bufs.left, { force = true })
-    pcall(vim.api.nvim_buf_delete, bufs.right, { force = true })
+    for _, b in ipairs({ bufs.left, bufs.right }) do
+      if b and not seen[b] then
+        seen[b] = true
+        pcall(vim.api.nvim_buf_delete, b, { force = true })
+      end
+    end
   end
   pcall(write_file, dir .. "/result", result)
   -- Signal the bash reader. Writing to a FIFO with no reader would block;
@@ -477,6 +660,7 @@ function M._save_comment_buffer(buf)
     end
   end)
   M._refresh_signs_for_file(ctx.file)
+  M.render_sidebar()
   vim.notify(string.format("crit-vim: comment %s (%s:%d)",
     ctx.edit_id and "updated" or "saved", ctx.file, ctx.start_line),
     vim.log.levels.INFO)
@@ -599,6 +783,7 @@ function M.delete_at_cursor()
   end
   if M._delete_comment(file, c.id) then
     M._refresh_signs_for_file(file)
+    M.render_sidebar()
     vim.notify("crit-vim: comment deleted", vim.log.levels.INFO)
   end
 end
@@ -609,12 +794,15 @@ function M.reopen()
     return
   end
   -- Wipe any stale review buffers we know about so we get a clean rebuild.
+  local seen = {}
   for _, bufs in pairs(M.session.file_bufs) do
-    if vim.api.nvim_buf_is_valid(bufs.left) then
-      pcall(vim.api.nvim_buf_delete, bufs.left, { force = true })
-    end
-    if vim.api.nvim_buf_is_valid(bufs.right) then
-      pcall(vim.api.nvim_buf_delete, bufs.right, { force = true })
+    for _, b in ipairs({ bufs.left, bufs.right }) do
+      if b and not seen[b] then
+        seen[b] = true
+        if vim.api.nvim_buf_is_valid(b) then
+          pcall(vim.api.nvim_buf_delete, b, { force = true })
+        end
+      end
     end
   end
   M.session.file_bufs = {}
@@ -622,65 +810,13 @@ function M.reopen()
     local bufs = open_file_diff(file_info, M.session.base, M.session.repo)
     M.session.file_bufs[file_info.path] = bufs
     if i == 1 then M.session.first_tab = bufs.tab end
+    open_sidebar_in_current_tab()
   end
   if M.session.first_tab then
     pcall(vim.api.nvim_set_current_tabpage, M.session.first_tab)
   end
   M.render_all_comments()
-end
-
-function M.files_picker()
-  if not M.session then
-    vim.notify("crit-vim: no active review", vim.log.levels.WARN)
-    return
-  end
-  local lines, statuses = {}, {}
-  for _, fi in ipairs(M.session.files) do
-    table.insert(lines, string.format("  [%-8s] %s", fi.status, fi.path))
-    table.insert(statuses, fi)
-  end
-
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].filetype = "critvim_files"
-
-  local width = math.min(100, math.max(50, math.floor(vim.o.columns * 0.6)))
-  local height = math.min(#lines + 2, math.max(8, math.floor(vim.o.lines * 0.5)))
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
-    style = "minimal",
-    border = "rounded",
-    title = " crit-vim files — <CR> jump · q close ",
-    title_pos = "center",
-  })
-
-  local function jump()
-    local row = vim.api.nvim_win_get_cursor(0)[1]
-    local fi = statuses[row]
-    pcall(vim.api.nvim_win_close, win, true)
-    if not fi then return end
-    local bufs = M.session.file_bufs[fi.path]
-    if bufs and bufs.tab and vim.api.nvim_tabpage_is_valid(bufs.tab) then
-      vim.api.nvim_set_current_tabpage(bufs.tab)
-    else
-      -- Tab was closed; rebuild then jump.
-      M.reopen()
-      bufs = M.session.file_bufs[fi.path]
-      if bufs and bufs.tab and vim.api.nvim_tabpage_is_valid(bufs.tab) then
-        vim.api.nvim_set_current_tabpage(bufs.tab)
-      end
-    end
-  end
-
-  vim.keymap.set("n", "<CR>", jump, { buffer = buf })
-  vim.keymap.set("n", "q", function() pcall(vim.api.nvim_win_close, win, true) end,
-    { buffer = buf })
+  M.render_sidebar()
 end
 
 -- ---------- rendering ----------
