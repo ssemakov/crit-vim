@@ -98,6 +98,17 @@ local function set_review_buffer(buf, file, side, syntax_for)
   end
 end
 
+-- Force the user's preferred line number + a visible signcolumn on a diff
+-- window. Without this, distros that hide numbers on `buftype=nofile`
+-- (LazyVim does) leave the gutter blank for added/deleted files (modified
+-- files survive because `:diffthis` keeps the column).
+local function set_diff_window_options(win)
+  win = win or 0
+  vim.wo[win].number         = vim.go.number
+  vim.wo[win].relativenumber = vim.go.relativenumber
+  vim.wo[win].signcolumn     = "yes"
+end
+
 local function fill_buffer(buf, lines)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines or {})
@@ -135,6 +146,7 @@ local function open_file_diff(file_info, base, repo)
     vim.api.nvim_buf_set_name(buf, file_info.path .. " [new]")
     fill_buffer(buf, read_working_file(repo, file_info.path))
     set_review_buffer(buf, file_info.path, "right", file_info.path)
+    set_diff_window_options(0)
     return { left = buf, right = buf, file = file_info.path,
              tab = vim.api.nvim_get_current_tabpage() }
   end
@@ -143,6 +155,7 @@ local function open_file_diff(file_info, base, repo)
     vim.api.nvim_buf_set_name(buf, file_info.path .. " [deleted]")
     fill_buffer(buf, git_show(repo, base, file_info.old_path or file_info.path))
     set_review_buffer(buf, file_info.path, "left", file_info.path)
+    set_diff_window_options(0)
     return { left = buf, right = buf, file = file_info.path,
              tab = vim.api.nvim_get_current_tabpage() }
   end
@@ -153,6 +166,7 @@ local function open_file_diff(file_info, base, repo)
   fill_buffer(right_buf, read_working_file(repo, file_info.path))
   set_review_buffer(right_buf, file_info.path, "right", file_info.path)
   vim.cmd("diffthis")
+  set_diff_window_options(0)
 
   vim.cmd("leftabove vsplit | enew")
   local left_buf = vim.api.nvim_get_current_buf()
@@ -160,6 +174,7 @@ local function open_file_diff(file_info, base, repo)
   fill_buffer(left_buf, git_show(repo, base, file_info.old_path or file_info.path))
   set_review_buffer(left_buf, file_info.path, "left", file_info.path)
   vim.cmd("diffthis")
+  set_diff_window_options(0)
 
   -- Land on the right (working-tree) side — that's where review focus is.
   vim.cmd("wincmd l")
