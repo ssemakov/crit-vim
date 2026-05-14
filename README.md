@@ -134,6 +134,21 @@ vim.keymap.set("n", "<leader>cF", "<cmd>CritFinish<cr>")
 vim.keymap.set("n", "<leader>cX", "<cmd>CritDelete<cr>")
 ```
 
+## Agent integration (Claude Code, Codex)
+
+Skill manifests live under `integrations/`:
+
+```
+integrations/claude-code/skills/crit-vim/SKILL.md
+integrations/codex/skills/crit-vim/SKILL.md
+```
+
+To enable, copy or symlink the `crit-vim/` directory into your agent's
+skills directory (e.g. `~/.claude/skills/` for Claude Code,
+`~/.codex/skills/` for Codex). After that, the agent can invoke `crit-vim`
+and will follow the documented loop: block on `crit-vim review`, read JSON,
+edit files, optionally start another round.
+
 ## CLI commands
 
 | Command                        | What it does                                        |
