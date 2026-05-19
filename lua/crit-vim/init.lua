@@ -134,6 +134,12 @@ function M._uninstall_review_keymaps(buf)
   pcall(vim.keymap.del, "n", "<leader>c",  { buffer = buf })
   pcall(vim.keymap.del, "x", "<leader>c",  { buffer = buf })
   pcall(vim.keymap.del, "n", "<leader>cc", { buffer = buf })
+  -- Clear the review markers so the LspAttach autocmd doesn't keep
+  -- re-installing our keymaps on a buffer that's no longer ours.
+  pcall(function()
+    vim.b[buf].crit_vim_side = nil
+    vim.b[buf].crit_vim_file = nil
+  end)
 end
 
 local function fill_buffer(buf, lines)
