@@ -60,27 +60,13 @@ vim.api.nvim_create_user_command("CritFinish", function() crit.finish() end,
 vim.api.nvim_create_user_command("CritCancel", function() crit.cancel() end,
   { desc = "crit-vim: cancel review; agent exits with code 1" })
 
--- ---------- keymaps ----------
--- Only two global bindings: the operator and 'comment current line'. Both
--- live under <leader>c but don't collide with LazyVim's <leader>c{letter}
--- bindings because we only consume <leader>cc and <leader>c<motion>.
+-- ---------- operator ----------
+-- The <leader>c keymaps live buffer-local on review buffers (set in
+-- open_file_diff via M._install_review_keymaps) so they don't shadow the
+-- user's normal <leader>cc / <leader>c bindings outside an active review.
 
 function _G.crit_vim_op(_motion_type)
   local s = vim.api.nvim_buf_get_mark(0, "[")
   local e = vim.api.nvim_buf_get_mark(0, "]")
   crit.comment_range(s, e)
 end
-
-vim.keymap.set("n", "<leader>c", function()
-  vim.o.operatorfunc = "v:lua.crit_vim_op"
-  return "g@"
-end, { expr = true, desc = "crit-vim: comment on motion" })
-
-vim.keymap.set("x", "<leader>c", function()
-  vim.o.operatorfunc = "v:lua.crit_vim_op"
-  return "g@"
-end, { expr = true, desc = "crit-vim: comment on selection" })
-
-vim.keymap.set("n", "<leader>cc", function()
-  crit.comment_line(vim.api.nvim_win_get_cursor(0)[1])
-end, { desc = "crit-vim: comment on current line" })

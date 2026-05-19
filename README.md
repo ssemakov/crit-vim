@@ -109,22 +109,29 @@ Inside the floating buffer (real vim — operators, registers, clipboard, etc.):
 
 ### Managing comments
 
-| Command       | Behaviour                                 |
-| ------------- | ----------------------------------------- |
-| `:CritEdit`   | edit comment under cursor                 |
-| `:CritDelete` | delete comment under cursor (prompts y/N) |
-| `:CritList`   | quickfix list of all comments             |
-| `:CritSidebar` | toggle the file list sidebar in this tab  |
+| Command        | Behaviour                                          |
+| -------------- | -------------------------------------------------- |
+| `:CritEdit`    | edit comment under cursor                          |
+| `:CritDelete`  | delete comment under cursor (prompts y/N)          |
+| `:CritList`    | quickfix list of all comments                      |
+| `:CritSidebar` | toggle the file list sidebar in this tab           |
 | `:CritReopen`  | rebuild diff tabs + sidebars (after `<C-w>o` etc.) |
+
+### Editing during review
+
+The right side of every modified or added file is the **real working-tree
+file** — fully editable with `:w` writing through to disk. The left side
+(base content) and deleted files stay read-only scratch buffers.
+
+Small fixes don't have to round-trip through the agent: edit inline, save,
+and the agent will see the changes when it re-reads the JSON.
 
 ### Submitting the review
 
-```vim
-:CritFinish
-```
-
-Pane B unblocks and prints the JSON to stdout. `:CritCancel` aborts; pane B
-exits 1.
+| Command       | Behaviour                                                                                                                                                                   |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `:CritFinish` | Auto-save any modified review files, then submit. The blocked agent unblocks and gets the JSON on stdout. Aborts with an error if a save fails (e.g. read-only filesystem). |
+| `:CritCancel` | Abort the review. Prompts y/N if any review file has unsaved edits and discards them on confirmation. The agent exits with code 1.                                          |
 
 We don't bind `<leader>cf`/`<leader>cs` etc. as global shortcuts because they
 collide with LazyVim's `<leader>c{letter}` group. Bind your own if you like:
@@ -233,14 +240,3 @@ comment via RPC, calls `:CritFinish`, and checks the resulting JSON.
 ```sh
 ./test/smoke.sh
 ```
-
-## Roadmap
-
-After this v0 dogfoods:
-
-- Swap storage to upstream `crit` CLI/HTTP — same JSON shape, daemon-owned
-  reviews, rounds, GitHub sync for free.
-- Resolve / unresolve action.
-- Replies (schema already there).
-- Bordered comment rendering (`virt_lines`).
-- File-scope and review-scope comments.

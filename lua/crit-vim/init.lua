@@ -96,6 +96,7 @@ local function set_review_buffer(buf, file, side, syntax_for)
     local ft = vim.filetype.match({ filename = syntax_for })
     if ft then vim.bo[buf].filetype = ft end
   end
+  M._install_review_keymaps(buf)
 end
 
 -- Force the user's preferred line number + a visible signcolumn on a diff
@@ -107,6 +108,32 @@ local function set_diff_window_options(win)
   vim.wo[win].number         = vim.go.number
   vim.wo[win].relativenumber = vim.go.relativenumber
   vim.wo[win].signcolumn     = "yes"
+end
+
+-- Install the comment-authoring keymaps as buffer-local on a review buffer.
+-- We don't bind these globally — that conflicted with Comment.nvim, GitLens,
+-- and other plugins that grab <leader>cc.
+function M._install_review_keymaps(buf)
+  vim.keymap.set("n", "<leader>c", function()
+    vim.o.operatorfunc = "v:lua.crit_vim_op"
+    return "g@"
+  end, { buffer = buf, expr = true, desc = "crit-vim: comment on motion" })
+
+  vim.keymap.set("x", "<leader>c", function()
+    vim.o.operatorfunc = "v:lua.crit_vim_op"
+    return "g@"
+  end, { buffer = buf, expr = true, desc = "crit-vim: comment on selection" })
+
+  vim.keymap.set("n", "<leader>cc", function()
+    M.comment_line(vim.api.nvim_win_get_cursor(0)[1])
+  end, { buffer = buf, desc = "crit-vim: comment on current line" })
+end
+
+function M._uninstall_review_keymaps(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  pcall(vim.keymap.del, "n", "<leader>c",  { buffer = buf })
+  pcall(vim.keymap.del, "x", "<leader>c",  { buffer = buf })
+  pcall(vim.keymap.del, "n", "<leader>cc", { buffer = buf })
 end
 
 local function fill_buffer(buf, lines)
@@ -121,36 +148,35 @@ local function git_show(repo, ref, path)
   return lines
 end
 
-local function read_working_file(repo, path)
-  local full = repo .. "/" .. path
-  local f = io.open(full, "r")
-  if not f then return {} end
-  local content = f:read("*a")
-  f:close()
-  local out = {}
-  for line in (content .. "\n"):gmatch("([^\n]*)\n") do
-    table.insert(out, line)
-  end
-  -- gmatch above leaves a trailing empty string for files ending in \n; drop it.
-  if out[#out] == "" then table.remove(out) end
-  return out
+-- Mark a real-file buffer as part of the review (so :CritComment etc. can
+-- find it) without making it read-only — the user may want to edit.
+local function mark_real_review_buffer(buf, file, side)
+  vim.bo[buf].buflisted = false
+  vim.b[buf].crit_vim_side = side
+  vim.b[buf].crit_vim_file = file
+  M._install_review_keymaps(buf)
+end
+
+local function tabedit_repo_file(repo, path)
+  vim.cmd("tabedit " .. vim.fn.fnameescape(repo .. "/" .. path))
 end
 
 local function open_file_diff(file_info, base, repo)
-  vim.cmd("tabnew")
-
-  -- Added or deleted: just one window — there's nothing to diff against on
-  -- the missing side. Comments use whichever side has content.
+  -- Added: just the working-tree file, editable. No left side to diff
+  -- against; the user reads top-to-bottom.
   if file_info.status == "added" then
+    tabedit_repo_file(repo, file_info.path)
     local buf = vim.api.nvim_get_current_buf()
-    vim.api.nvim_buf_set_name(buf, file_info.path .. " [new]")
-    fill_buffer(buf, read_working_file(repo, file_info.path))
-    set_review_buffer(buf, file_info.path, "right", file_info.path)
+    mark_real_review_buffer(buf, file_info.path, "right")
     set_diff_window_options(0)
     return { left = buf, right = buf, file = file_info.path,
              tab = vim.api.nvim_get_current_tabpage() }
   end
+
+  -- Deleted: file is gone from the worktree, so no editable side. Show the
+  -- base content in a read-only scratch buffer.
   if file_info.status == "deleted" then
+    vim.cmd("tabnew")
     local buf = vim.api.nvim_get_current_buf()
     vim.api.nvim_buf_set_name(buf, file_info.path .. " [deleted]")
     fill_buffer(buf, git_show(repo, base, file_info.old_path or file_info.path))
@@ -160,11 +186,12 @@ local function open_file_diff(file_info, base, repo)
              tab = vim.api.nvim_get_current_tabpage() }
   end
 
-  -- Modified / renamed: side-by-side diff.
+  -- Modified / renamed: side-by-side diff. Right is the real working-tree
+  -- file (editable, :w writes through). Left is a read-only scratch with
+  -- the base content from `git show`.
+  tabedit_repo_file(repo, file_info.path)
   local right_buf = vim.api.nvim_get_current_buf()
-  vim.api.nvim_buf_set_name(right_buf, file_info.path .. " [working]")
-  fill_buffer(right_buf, read_working_file(repo, file_info.path))
-  set_review_buffer(right_buf, file_info.path, "right", file_info.path)
+  mark_real_review_buffer(right_buf, file_info.path, "right")
   vim.cmd("diffthis")
   set_diff_window_options(0)
 
@@ -421,21 +448,57 @@ function M.start_review(session_dir)
   return true
 end
 
-close_session = function(result)
+-- Close review tabs without touching real-file buffers. Real-file buffers
+-- may belong to the user's pre-existing workspace (they had the file open
+-- before crit-vim review, or `:tabedit` reused an existing buffer); we don't
+-- own them, so we don't wipe them. Scratch buffers we created (sidebar, base
+-- content, deleted-file views) are wiped explicitly.
+local function teardown_session_ui()
   if not M.session then return end
-  local dir = M.session.dir
+  -- Uninstall buffer-local keymaps from real-file buffers; otherwise our
+  -- <leader>cc would still shadow the user's normal binding after the
+  -- review ends.
+  local kmseen = {}
+  for _, bufs in pairs(M.session.file_bufs) do
+    for _, b in ipairs({ bufs.left, bufs.right }) do
+      if b and not kmseen[b] and vim.api.nvim_buf_is_valid(b)
+         and vim.bo[b].buftype == "" then
+        kmseen[b] = true
+        M._uninstall_review_keymaps(b)
+      end
+    end
+  end
+  local tabs_seen = {}
+  for _, bufs in pairs(M.session.file_bufs) do
+    if bufs.tab and not tabs_seen[bufs.tab]
+       and vim.api.nvim_tabpage_is_valid(bufs.tab) then
+      tabs_seen[bufs.tab] = true
+      pcall(function()
+        local n = vim.api.nvim_tabpage_get_number(bufs.tab)
+        vim.cmd(n .. "tabclose")
+      end)
+    end
+  end
   if M.session.sidebar_buf and vim.api.nvim_buf_is_valid(M.session.sidebar_buf) then
     pcall(vim.api.nvim_buf_delete, M.session.sidebar_buf, { force = true })
+    M.session.sidebar_buf = nil
   end
   local seen = {}
   for _, bufs in pairs(M.session.file_bufs) do
     for _, b in ipairs({ bufs.left, bufs.right }) do
-      if b and not seen[b] then
+      if b and not seen[b] and vim.api.nvim_buf_is_valid(b)
+         and vim.bo[b].buftype == "nofile" then
         seen[b] = true
         pcall(vim.api.nvim_buf_delete, b, { force = true })
       end
     end
   end
+end
+
+close_session = function(result)
+  if not M.session then return end
+  local dir = M.session.dir
+  teardown_session_ui()
   pcall(write_file, dir .. "/result", result)
   -- Signal the bash reader. Writing to a FIFO with no reader would block;
   -- the bash side opens the read end before invoking us, so this is safe.
@@ -454,21 +517,72 @@ local function count_comments(session)
   return n
 end
 
+-- Walk every right-side review buffer and report which are dirty real-file
+-- buffers — the ones whose unsaved edits would be invisible to the agent.
+local function dirty_review_files()
+  local dirty, seen = {}, {}
+  if not M.session then return dirty end
+  for path, bufs in pairs(M.session.file_bufs) do
+    local b = bufs.right
+    if b and not seen[b] and vim.api.nvim_buf_is_valid(b)
+       and vim.bo[b].buftype == "" and vim.bo[b].modified then
+      seen[b] = true
+      table.insert(dirty, { buf = b, path = path })
+    end
+  end
+  return dirty
+end
+
+local function save_dirty_review_files()
+  local saved, failed = 0, 0
+  for _, entry in ipairs(dirty_review_files()) do
+    local ok = pcall(vim.api.nvim_buf_call, entry.buf, function()
+      vim.cmd("silent write")
+    end)
+    if ok then saved = saved + 1 else failed = failed + 1 end
+  end
+  return saved, failed
+end
+
 function M.finish()
   if not M.session then
     vim.notify("crit-vim: no active review", vim.log.levels.WARN)
     return
   end
+  local saved, failed = save_dirty_review_files()
+  if failed > 0 then
+    vim.notify(string.format(
+      "crit-vim: %d file(s) could not be saved — fix and retry, or :CritCancel to discard",
+      failed), vim.log.levels.ERROR)
+    return
+  end
   local n = count_comments(M.session)
   close_session("ok")
-  vim.notify(string.format("crit-vim: submitted review (%d comment%s)",
-    n, n == 1 and "" or "s"), vim.log.levels.INFO)
+  local extra = saved > 0
+    and string.format(" · saved %d edited file%s", saved, saved == 1 and "" or "s")
+    or ""
+  vim.notify(string.format("crit-vim: submitted review (%d comment%s)%s",
+    n, n == 1 and "" or "s", extra), vim.log.levels.INFO)
 end
 
 function M.cancel()
   if not M.session then
     vim.notify("crit-vim: no active review", vim.log.levels.WARN)
     return
+  end
+  local dirty = dirty_review_files()
+  if #dirty > 0 then
+    local resp = vim.fn.input(string.format(
+      "crit-vim: %d file(s) have unsaved edits — discard? (y/N) ", #dirty))
+    if (resp or ""):lower() ~= "y" then
+      vim.notify("crit-vim: cancel aborted (use :CritFinish to save & submit)",
+        vim.log.levels.INFO)
+      return
+    end
+    -- Discard unsaved changes by reverting the buffers.
+    for _, e in ipairs(dirty) do
+      pcall(vim.api.nvim_buf_call, e.buf, function() vim.cmd("silent edit!") end)
+    end
   end
   close_session("cancel")
   vim.notify("crit-vim: review cancelled", vim.log.levels.WARN)
@@ -808,18 +922,9 @@ function M.reopen()
     vim.notify("crit-vim: no active review", vim.log.levels.WARN)
     return
   end
-  -- Wipe any stale review buffers we know about so we get a clean rebuild.
-  local seen = {}
-  for _, bufs in pairs(M.session.file_bufs) do
-    for _, b in ipairs({ bufs.left, bufs.right }) do
-      if b and not seen[b] then
-        seen[b] = true
-        if vim.api.nvim_buf_is_valid(b) then
-          pcall(vim.api.nvim_buf_delete, b, { force = true })
-        end
-      end
-    end
-  end
+  -- Tear down stale tabs + scratch buffers; preserve real-file buffers (they
+  -- may hold the user's unsaved edits — we don't want to lose those).
+  teardown_session_ui()
   M.session.file_bufs = {}
   for i, file_info in ipairs(M.session.files) do
     local bufs = open_file_diff(file_info, M.session.base, M.session.repo)
