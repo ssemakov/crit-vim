@@ -1,13 +1,12 @@
 # crit-vim
 
-Review an agent's diff inside your running Neovim and ship the comments back
+![crit-vim in Neovim](img/nvim-screenshot.png)
+
+Review an agent's diff inside your running Neovim and return the comments back
 as JSON. A vim-native frontend for the agent/human review handshake, with the
-JSON shape kept compatible with [tomasz-tomczyk/crit] so we can swap to its
-daemon API later without touching the agent side.
+JSON shape kept compatible with [tomasz-tomczyk/crit](https://github.com/tomasz-tomczyk/crit)
 
-[tomasz-tomczyk/crit]: https://github.com/tomasz-tomczyk/crit
-
-This is an intentionally minimal MVP:
+## Features
 
 - Single review round.
 - Line/range comments only (no replies, no resolve toggle, no scopes).
@@ -74,7 +73,7 @@ In the shell:
 crit-vim review --base HEAD
 ```
 
-That blocks. In nvim, **one diff tab opens per changed file** (tracked
+That blocks the shell. In nvim, **one diff tab opens per changed file** (tracked
 modifications + untracked-but-present files, treated as added). A persistent
 **sidebar** appears at the left of every review tab showing the file list with
 comment counts — `<CR>` on a row jumps to that file's diff, `q` closes the
@@ -226,10 +225,8 @@ Kept shape-compatible with upstream `crit status --code`:
 }
 ```
 
-We own this file (in `$TMPDIR/crit-vim/<sid>/comments.json`). When we later
-switch to the upstream daemon, we replace two functions in `lua/crit-vim/init.lua`
-(`_append_comment` and the reads in `_refresh_signs_for_file`) with calls to
-`crit comment --json` / `crit status --json`. The schema stays put.
+We own this file (in `$TMPDIR/crit-vim/<sid>/comments.json`) for now. We may later
+switch to the upstream daemon.
 
 ## Smoke test
 
