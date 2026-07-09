@@ -48,6 +48,19 @@ vim.api.nvim_create_autocmd("LspAttach", {
   end,
 })
 
+-- Belt-and-suspenders: every time the user actually enters a review buffer,
+-- re-install our keymaps. Guarantees our binding wins even when another
+-- plugin's autocmd bound `<leader>cc` later than our LspAttach schedule
+-- fired.
+vim.api.nvim_create_autocmd("BufEnter", {
+  group = group,
+  callback = function(args)
+    if not crit.session then return end
+    if not vim.b[args.buf].crit_vim_side then return end
+    crit._install_review_keymaps(args.buf)
+  end,
+})
+
 -- ---------- commands ----------
 -- Ex commands are the canonical interface; pick whatever <leader> bindings
 -- you like on top of them. They are safe from which-key/global collisions.
