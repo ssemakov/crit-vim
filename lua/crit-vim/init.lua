@@ -7,15 +7,31 @@ M.session = nil          -- {dir, base, repo, files, file_bufs, tab_pages}
 M._comment_ctx = {}      -- bufnr -> draft context
 M._ns = vim.api.nvim_create_namespace("crit_vim")
 
-local SIGN_GROUP = "crit_vim"
-local SIGN_NAME = "CritVimComment"
-local sign_defined = false
-
-local function ensure_sign()
-  if sign_defined then return end
-  vim.fn.sign_define(SIGN_NAME, { text = ">>", texthl = "DiagnosticInfo" })
-  sign_defined = true
+-- Highlight groups used for the inline comment overlay. All default-linked
+-- so a user colorscheme's explicit definitions win.
+--
+-- The box body uses NormalFloat (distinct from Normal by design), so the
+-- comment reads as a floating card sitting on top of the code, with an
+-- explicit border around it.
+local function ensure_highlights()
+  local hls = {
+    CritVimCommentBar    = { link = "DiagnosticInfo" },  -- signcolumn bar
+    CritVimCommentRange  = { link = "DiffChange" },      -- background of the commented range
+    CritVimCommentBorder = { link = "FloatBorder" },     -- ╭─╮│╰─╯ around the box
+    CritVimCommentBody   = { link = "NormalFloat" },     -- box interior text + padding
+    CritVimCommentMeta   = { link = "NonText" },         -- resolved marker etc.
+  }
+  for name, spec in pairs(hls) do
+    spec.default = true
+    vim.api.nvim_set_hl(0, name, spec)
+  end
 end
+
+-- Re-apply defaults after a colorscheme swap (which does `hi clear`).
+vim.api.nvim_create_autocmd("ColorScheme", {
+  group = vim.api.nvim_create_augroup("crit_vim_highlights", { clear = true }),
+  callback = ensure_highlights,
+})
 
 -- ---------- filesystem / json helpers ----------
 
@@ -389,7 +405,7 @@ function M.start_review(session_dir)
     assert(meta, "cannot read meta.json")
     assert(meta.repo_root and meta.base and meta.files, "meta.json missing fields")
 
-    ensure_sign()
+    ensure_highlights()
 
     M.session = {
       dir = session_dir,
@@ -922,12 +938,11 @@ function M._refresh_signs_for_file(file)
   local bufs = M.session and M.session.file_bufs[file]
   if not bufs then return end
 
-  -- For added/deleted files left==right; dedupe so we don't unplace twice.
+  -- For added/deleted files left==right; dedupe so we don't clear twice.
   local seen = {}
   for _, buf in ipairs({ bufs.left, bufs.right }) do
     if not seen[buf] and vim.api.nvim_buf_is_valid(buf) then
       seen[buf] = true
-      vim.fn.sign_unplace(SIGN_GROUP, { buffer = buf })
       vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
     end
   end
@@ -938,17 +953,69 @@ function M._refresh_signs_for_file(file)
   for _, c in ipairs(data.files[file].comments or {}) do
     local buf = c.side == "left" and bufs.left or bufs.right
     if vim.api.nvim_buf_is_valid(buf) then
-      vim.fn.sign_place(0, SIGN_GROUP, SIGN_NAME, buf,
-        { lnum = c.start_line, priority = 50 })
-      local first_line = (c.body or ""):gsub("\r?\n.*$", "")
-      if #first_line > 60 then first_line = first_line:sub(1, 57) .. "..." end
-      local marker = c.resolved and " ✓" or ""
-      vim.api.nvim_buf_set_extmark(buf, M._ns, c.start_line - 1, 0, {
-        virt_text = {
-          { "  " .. first_line, "Comment" },
-          { string.format(" @%s%s", c.author or "?", marker), "NonText" },
-        },
-        virt_text_pos = "eol",
+      local line_count = vim.api.nvim_buf_line_count(buf)
+      local start_l = math.max((c.start_line or 1) - 1, 0)
+      local end_l   = math.min((c.end_line or c.start_line or 1) - 1, line_count - 1)
+      if end_l < start_l then end_l = start_l end
+
+      -- Bar in the sign column + range background on every line of the
+      -- comment span. One extmark per line so it survives partial edits.
+      for l = start_l, end_l do
+        vim.api.nvim_buf_set_extmark(buf, M._ns, l, 0, {
+          sign_text = "▎",
+          sign_hl_group = "CritVimCommentBar",
+          line_hl_group = "CritVimCommentRange",
+          priority = 50,
+        })
+      end
+
+      -- Bordered comment box rendered as virt_lines below the range.
+      -- Padded to a consistent inner width so the box background reads
+      -- as one solid contrasting card.
+      local body = c.body or ""
+      local body_lines = vim.split(body, "\r?\n")
+      local resolved_marker = c.resolved and "  ✓" or ""
+      local author_line = "@" .. (c.author or "?") .. resolved_marker
+
+      local content = { author_line }
+      for _, bl in ipairs(body_lines) do table.insert(content, bl) end
+
+      local inner_width = 20  -- min
+      for _, ln in ipairs(content) do
+        inner_width = math.max(inner_width, vim.fn.strdisplaywidth(ln))
+      end
+      if inner_width > 100 then inner_width = 100 end
+
+      local border_top    = "╭" .. string.rep("─", inner_width + 2) .. "╮"
+      local border_bottom = "╰" .. string.rep("─", inner_width + 2) .. "╯"
+
+      local virt = {
+        { { border_top, "CritVimCommentBorder" } },
+      }
+      for i, ln in ipairs(content) do
+        local pad = inner_width - vim.fn.strdisplaywidth(ln)
+        if pad < 0 then pad = 0 end
+        table.insert(virt, {
+          { "│ ",                       "CritVimCommentBorder" },
+          { ln,                         "CritVimCommentBody" },
+          { string.rep(" ", pad) .. " ", "CritVimCommentBody" },
+          { "│",                        "CritVimCommentBorder" },
+        })
+        -- Blank spacer under the author header for breathing room.
+        if i == 1 and #content > 1 then
+          table.insert(virt, {
+            { "│ ",                                "CritVimCommentBorder" },
+            { string.rep(" ", inner_width + 1),    "CritVimCommentBody" },
+            { "│",                                 "CritVimCommentBorder" },
+          })
+        end
+      end
+      table.insert(virt, { { border_bottom, "CritVimCommentBorder" } })
+
+      vim.api.nvim_buf_set_extmark(buf, M._ns, end_l, 0, {
+        virt_lines = virt,
+        virt_lines_above = false,
+        priority = 50,
       })
     end
   end
