@@ -82,22 +82,43 @@ auto-tracks the current tab. `gt`/`gT` also work for plain tab nav.
 
 ### Authoring comments
 
-Pick a range, then drop into a floating comment buffer:
+crit-vim exposes two `<Plug>` mappings and no default `<leader>` bindings —
+you pick the keys. Bind them to whatever you like:
+
+```lua
+-- lazy.nvim spec
+keys = {
+  { "<leader>C",  "<Plug>(CritComment)",     mode = { "n", "x" }, desc = "Crit: comment (motion / visual)" },
+  { "<leader>CC", "<Plug>(CritCommentLine)", mode = "n",          desc = "Crit: comment current line" },
+}
+```
+
+Or, if you don't want to write keys yourself:
+
+```lua
+require("crit-vim").setup({ default_keys = true })  -- binds <leader>C{,C}
+```
+
+`<leader>C` is only a suggestion — any key works. `<Plug>(CritComment)` is a
+vim operator (works with any motion, text-object, or visual selection);
+`<Plug>(CritCommentLine)` is a linewise convenience. They silently no-op
+outside a review buffer, so binding them globally is safe.
+
+With the suggested `<leader>C{,C}` bindings:
 
 | To comment on...                 | Do this                                                         |
 | -------------------------------- | --------------------------------------------------------------- |
-| the current line                 | `<leader>cc`                                                    |
-| a paragraph                      | `<leader>cap` (operator + text-object)                          |
-| this line and the next 4         | `<leader>c4j` (operator + count + motion)                       |
-| down to the next blank line      | `<leader>c}`                                                    |
-| inside quotes / brackets / a tag | `<leader>ci"` / `<leader>ci(` / `<leader>cit`                   |
-| an arbitrary visual selection    | `V` → move → `<leader>c` (linewise) or `v` → move → `<leader>c` |
+| the current line                 | `<leader>CC`                                                    |
+| a paragraph                      | `<leader>Cap` (operator + text-object)                          |
+| this line and the next 4         | `<leader>C4j` (operator + count + motion)                       |
+| down to the next blank line      | `<leader>C}`                                                    |
+| inside quotes / brackets / a tag | `<leader>Ci"` / `<leader>Ci(` / `<leader>Cit`                   |
+| an arbitrary visual selection    | `V` → move → `<leader>C` (linewise) or `v` → move → `<leader>C` |
 | an explicit line range           | `:42,55CritComment`                                             |
 
-Anywhere you'd use a vim motion or text-object after `d`/`y`/`c`, you can use
-it after `<leader>c`. The saved comment is anchored to the **line range** the
-motion covered (upstream's schema is line-based); the exact selected text is
-preserved in the comment's `quote` field.
+The saved comment is anchored to the **line range** the motion covered
+(upstream's schema is line-based); the exact selected text is preserved in
+the comment's `quote` field.
 
 Inside the floating buffer (real vim — operators, registers, clipboard, etc.):
 

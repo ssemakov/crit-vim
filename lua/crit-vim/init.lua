@@ -96,7 +96,6 @@ local function set_review_buffer(buf, file, side, syntax_for)
     local ft = vim.filetype.match({ filename = syntax_for })
     if ft then vim.bo[buf].filetype = ft end
   end
-  M._install_review_keymaps(buf)
 end
 
 -- Force the user's preferred line number + a visible signcolumn on a diff
@@ -110,32 +109,12 @@ local function set_diff_window_options(win)
   vim.wo[win].signcolumn     = "yes"
 end
 
--- Install the comment-authoring keymaps as buffer-local on a review buffer.
--- We don't bind these globally — that conflicted with Comment.nvim, GitLens,
--- and other plugins that grab <leader>cc.
-function M._install_review_keymaps(buf)
-  vim.keymap.set("n", "<leader>c", function()
-    vim.o.operatorfunc = "v:lua.crit_vim_op"
-    return "g@"
-  end, { buffer = buf, expr = true, desc = "crit-vim: comment on motion" })
-
-  vim.keymap.set("x", "<leader>c", function()
-    vim.o.operatorfunc = "v:lua.crit_vim_op"
-    return "g@"
-  end, { buffer = buf, expr = true, desc = "crit-vim: comment on selection" })
-
-  vim.keymap.set("n", "<leader>cc", function()
-    M.comment_line(vim.api.nvim_win_get_cursor(0)[1])
-  end, { buffer = buf, desc = "crit-vim: comment on current line" })
-end
-
-function M._uninstall_review_keymaps(buf)
+-- Clear the review markers when a buffer is no longer part of a review.
+-- The <Plug> mappings guard on M.session anyway, so this is mainly to keep
+-- comment_at_cursor from finding stale side/file on real-file buffers that
+-- outlived the review.
+local function clear_review_buffer_vars(buf)
   if not vim.api.nvim_buf_is_valid(buf) then return end
-  pcall(vim.keymap.del, "n", "<leader>c",  { buffer = buf })
-  pcall(vim.keymap.del, "x", "<leader>c",  { buffer = buf })
-  pcall(vim.keymap.del, "n", "<leader>cc", { buffer = buf })
-  -- Clear the review markers so the LspAttach autocmd doesn't keep
-  -- re-installing our keymaps on a buffer that's no longer ours.
   pcall(function()
     vim.b[buf].crit_vim_side = nil
     vim.b[buf].crit_vim_file = nil
@@ -160,7 +139,6 @@ local function mark_real_review_buffer(buf, file, side)
   vim.bo[buf].buflisted = false
   vim.b[buf].crit_vim_side = side
   vim.b[buf].crit_vim_file = file
-  M._install_review_keymaps(buf)
 end
 
 local function tabedit_repo_file(repo, path)
@@ -461,16 +439,15 @@ end
 -- content, deleted-file views) are wiped explicitly.
 local function teardown_session_ui()
   if not M.session then return end
-  -- Uninstall buffer-local keymaps from real-file buffers; otherwise our
-  -- <leader>cc would still shadow the user's normal binding after the
-  -- review ends.
-  local kmseen = {}
+  -- Clear the review markers on real-file buffers so comment_at_cursor
+  -- doesn't find them after the review ends.
+  local seen_bv = {}
   for _, bufs in pairs(M.session.file_bufs) do
     for _, b in ipairs({ bufs.left, bufs.right }) do
-      if b and not kmseen[b] and vim.api.nvim_buf_is_valid(b)
+      if b and not seen_bv[b] and vim.api.nvim_buf_is_valid(b)
          and vim.bo[b].buftype == "" then
-        kmseen[b] = true
-        M._uninstall_review_keymaps(b)
+        seen_bv[b] = true
+        clear_review_buffer_vars(b)
       end
     end
   end
@@ -716,15 +693,12 @@ local function open_comment_buffer(ctx)
 end
 
 function M.comment_range(s, e)
-  if not M.session then
-    vim.notify("crit-vim: no active review", vim.log.levels.WARN)
-    return
-  end
+  -- Silent no-op when there's no active review or the current buffer isn't
+  -- part of one — so users can bind <Plug>(CritComment) globally without
+  -- getting warnings every time they press the key elsewhere.
+  if not M.session then return end
   local info_buf, side, file = review_buffer_info()
-  if not info_buf then
-    vim.notify("crit-vim: not in a review buffer", vim.log.levels.WARN)
-    return
-  end
+  if not info_buf then return end
   local sl = math.min(s[1], e[1])
   local el = math.max(s[1], e[1])
   -- A motion past EOB can yield 0 for end_line; clamp.
@@ -743,10 +717,7 @@ function M.comment_range(s, e)
 end
 
 function M.comment_line(line)
-  if not M.session then
-    vim.notify("crit-vim: no active review", vim.log.levels.WARN)
-    return
-  end
+  if not M.session then return end
   M.comment_range({ line }, { line })
 end
 
@@ -1014,6 +985,19 @@ function M.list()
   end
   vim.fn.setqflist({}, " ", { title = "crit-vim comments", items = items })
   vim.cmd("copen")
+end
+
+-- Optional convenience for users who don't want to write their own `keys`
+-- block. Call with `{ default_keys = true }` to bind <leader>C{,C} to the
+-- <Plug> targets globally.
+function M.setup(opts)
+  opts = opts or {}
+  if opts.default_keys then
+    vim.keymap.set({ "n", "x" }, "<leader>C", "<Plug>(CritComment)",
+      { desc = "Crit: comment (motion / visual)" })
+    vim.keymap.set("n", "<leader>CC", "<Plug>(CritCommentLine)",
+      { desc = "Crit: comment current line" })
+  end
 end
 
 return M

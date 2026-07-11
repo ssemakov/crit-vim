@@ -27,45 +27,16 @@ vim.api.nvim_create_autocmd("TabEnter", {
   callback = function() crit._reposition_sidebar_cursor() end,
 })
 
--- LSP attaches asynchronously, so its on_attach (which often binds
--- <leader>cc to vim.lsp.codelens.run) can fire after our review keymaps
--- are installed and override them. Re-install on LspAttach so the
--- review buffer wins.
-vim.api.nvim_create_autocmd("LspAttach", {
-  group = group,
-  callback = function(args)
-    local buf = args.buf
-    if not crit.session then return end
-    if not vim.b[buf].crit_vim_side then return end
-    -- Defer past the attaching client's own on_attach keymap registration.
-    vim.schedule(function()
-      if vim.api.nvim_buf_is_valid(buf)
-         and crit.session
-         and vim.b[buf].crit_vim_side then
-        crit._install_review_keymaps(buf)
-      end
-    end)
-  end,
-})
-
--- Belt-and-suspenders: every time the user actually enters a review buffer,
--- re-install our keymaps. Guarantees our binding wins even when another
--- plugin's autocmd bound `<leader>cc` later than our LspAttach schedule
--- fired.
-vim.api.nvim_create_autocmd("BufEnter", {
-  group = group,
-  callback = function(args)
-    if not crit.session then return end
-    if not vim.b[args.buf].crit_vim_side then return end
-    crit._install_review_keymaps(args.buf)
-  end,
-})
 
 -- ---------- commands ----------
 -- Ex commands are the canonical interface; pick whatever <leader> bindings
 -- you like on top of them. They are safe from which-key/global collisions.
 
 vim.api.nvim_create_user_command("CritComment", function(opts)
+  if not crit.session then
+    vim.notify("crit-vim: no active review", vim.log.levels.WARN)
+    return
+  end
   if opts.range == 2 then
     crit.comment_range({ opts.line1 }, { opts.line2 })
   else
@@ -94,13 +65,28 @@ vim.api.nvim_create_user_command("CritFinish", function() crit.finish() end,
 vim.api.nvim_create_user_command("CritCancel", function() crit.cancel() end,
   { desc = "crit-vim: cancel review; agent exits with code 1" })
 
--- ---------- operator ----------
--- The <leader>c keymaps live buffer-local on review buffers (set in
--- open_file_diff via M._install_review_keymaps) so they don't shadow the
--- user's normal <leader>cc / <leader>c bindings outside an active review.
+-- ---------- <Plug> mappings ----------
+-- These are the plugin's public keymap API. Users bind them to whatever
+-- keys they like (see README). <Plug> targets can't be typed directly so
+-- they never collide with Comment.nvim, LSP codelens, or anything else.
+-- Silent no-op outside an active review — safe to bind globally.
 
 function _G.crit_vim_op(_motion_type)
   local s = vim.api.nvim_buf_get_mark(0, "[")
   local e = vim.api.nvim_buf_get_mark(0, "]")
   crit.comment_range(s, e)
 end
+
+vim.keymap.set("n", "<Plug>(CritComment)", function()
+  vim.o.operatorfunc = "v:lua.crit_vim_op"
+  return "g@"
+end, { expr = true, desc = "crit-vim: comment on motion" })
+
+vim.keymap.set("x", "<Plug>(CritComment)", function()
+  vim.o.operatorfunc = "v:lua.crit_vim_op"
+  return "g@"
+end, { expr = true, desc = "crit-vim: comment on selection" })
+
+vim.keymap.set("n", "<Plug>(CritCommentLine)", function()
+  crit.comment_line(vim.api.nvim_win_get_cursor(0)[1])
+end, { desc = "crit-vim: comment on current line" })
