@@ -7,15 +7,31 @@ M.session = nil          -- {dir, base, repo, files, file_bufs, tab_pages}
 M._comment_ctx = {}      -- bufnr -> draft context
 M._ns = vim.api.nvim_create_namespace("crit_vim")
 
-local SIGN_GROUP = "crit_vim"
-local SIGN_NAME = "CritVimComment"
-local sign_defined = false
-
-local function ensure_sign()
-  if sign_defined then return end
-  vim.fn.sign_define(SIGN_NAME, { text = ">>", texthl = "DiagnosticInfo" })
-  sign_defined = true
+-- Highlight groups used for the inline comment overlay. All default-linked
+-- so a user colorscheme's explicit definitions win.
+--
+-- The box body uses NormalFloat (distinct from Normal by design), so the
+-- comment reads as a floating card sitting on top of the code, with an
+-- explicit border around it.
+local function ensure_highlights()
+  local hls = {
+    CritVimCommentBar    = { link = "DiagnosticInfo" },  -- signcolumn bar
+    CritVimCommentRange  = { link = "DiffChange" },      -- background of the commented range
+    CritVimCommentBorder = { link = "FloatBorder" },     -- ╭─╮│╰─╯ around the box
+    CritVimCommentBody   = { link = "NormalFloat" },     -- box interior text + padding
+    CritVimCommentMeta   = { link = "NonText" },         -- resolved marker etc.
+  }
+  for name, spec in pairs(hls) do
+    spec.default = true
+    vim.api.nvim_set_hl(0, name, spec)
+  end
 end
+
+-- Re-apply defaults after a colorscheme swap (which does `hi clear`).
+vim.api.nvim_create_autocmd("ColorScheme", {
+  group = vim.api.nvim_create_augroup("crit_vim_highlights", { clear = true }),
+  callback = ensure_highlights,
+})
 
 -- ---------- filesystem / json helpers ----------
 
@@ -389,7 +405,7 @@ function M.start_review(session_dir)
     assert(meta, "cannot read meta.json")
     assert(meta.repo_root and meta.base and meta.files, "meta.json missing fields")
 
-    ensure_sign()
+    ensure_highlights()
 
     M.session = {
       dir = session_dir,
@@ -918,16 +934,50 @@ end
 
 -- ---------- rendering ----------
 
+-- Word-wrap `text` so no segment exceeds `width` display cells. Falls back
+-- to a hard character-boundary split for tokens that are longer than
+-- `width` on their own (e.g. a giant URL).
+local function wrap_line(text, width)
+  if vim.fn.strdisplaywidth(text) <= width then return { text } end
+
+  local out = {}
+  local cur = ""
+  local function push(s)
+    while vim.fn.strdisplaywidth(s) > width do
+      local n = 1
+      while n <= #s and vim.fn.strdisplaywidth(s:sub(1, n)) <= width do
+        n = n + 1
+      end
+      table.insert(out, s:sub(1, n - 1))
+      s = s:sub(n)
+    end
+    if #s > 0 then table.insert(out, s) end
+  end
+
+  for _, w in ipairs(vim.split(text, " ", { plain = true })) do
+    if cur == "" then
+      cur = w
+    elseif vim.fn.strdisplaywidth(cur .. " " .. w) <= width then
+      cur = cur .. " " .. w
+    else
+      push(cur)
+      cur = w
+    end
+  end
+  if cur ~= "" then push(cur) end
+
+  return out
+end
+
 function M._refresh_signs_for_file(file)
   local bufs = M.session and M.session.file_bufs[file]
   if not bufs then return end
 
-  -- For added/deleted files left==right; dedupe so we don't unplace twice.
+  -- For added/deleted files left==right; dedupe so we don't clear twice.
   local seen = {}
   for _, buf in ipairs({ bufs.left, bufs.right }) do
     if not seen[buf] and vim.api.nvim_buf_is_valid(buf) then
       seen[buf] = true
-      vim.fn.sign_unplace(SIGN_GROUP, { buffer = buf })
       vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
     end
   end
@@ -938,17 +988,79 @@ function M._refresh_signs_for_file(file)
   for _, c in ipairs(data.files[file].comments or {}) do
     local buf = c.side == "left" and bufs.left or bufs.right
     if vim.api.nvim_buf_is_valid(buf) then
-      vim.fn.sign_place(0, SIGN_GROUP, SIGN_NAME, buf,
-        { lnum = c.start_line, priority = 50 })
-      local first_line = (c.body or ""):gsub("\r?\n.*$", "")
-      if #first_line > 60 then first_line = first_line:sub(1, 57) .. "..." end
-      local marker = c.resolved and " ✓" or ""
-      vim.api.nvim_buf_set_extmark(buf, M._ns, c.start_line - 1, 0, {
-        virt_text = {
-          { "  " .. first_line, "Comment" },
-          { string.format(" @%s%s", c.author or "?", marker), "NonText" },
-        },
-        virt_text_pos = "eol",
+      local line_count = vim.api.nvim_buf_line_count(buf)
+      local start_l = math.max((c.start_line or 1) - 1, 0)
+      local end_l   = math.min((c.end_line or c.start_line or 1) - 1, line_count - 1)
+      if end_l < start_l then end_l = start_l end
+
+      -- Bar in the sign column + range background on every line of the
+      -- comment span. One extmark per line so it survives partial edits.
+      for l = start_l, end_l do
+        vim.api.nvim_buf_set_extmark(buf, M._ns, l, 0, {
+          sign_text = "▎",
+          sign_hl_group = "CritVimCommentBar",
+          line_hl_group = "CritVimCommentRange",
+          priority = 50,
+        })
+      end
+
+      -- Bordered comment box rendered as virt_lines below the range.
+      -- Padded to a consistent inner width so the box background reads
+      -- as one solid contrasting card. Long lines are word-wrapped at
+      -- `target_width` cells so nothing overflows the box.
+      local body = c.body or ""
+      local body_lines = vim.split(body, "\r?\n")
+      local resolved_marker = c.resolved and "  ✓" or ""
+      local author_line = "@" .. (c.author or "?") .. resolved_marker
+
+      local target_width = 76
+
+      local wrapped_author = wrap_line(author_line, target_width)
+      local wrapped_body = {}
+      for _, bl in ipairs(body_lines) do
+        local segs = wrap_line(bl, target_width)
+        if #segs == 0 then
+          table.insert(wrapped_body, "")
+        else
+          for _, seg in ipairs(segs) do table.insert(wrapped_body, seg) end
+        end
+      end
+
+      local inner_width = 20  -- min
+      for _, s in ipairs(wrapped_author) do
+        inner_width = math.max(inner_width, vim.fn.strdisplaywidth(s))
+      end
+      for _, s in ipairs(wrapped_body) do
+        inner_width = math.max(inner_width, vim.fn.strdisplaywidth(s))
+      end
+      if inner_width > target_width then inner_width = target_width end
+
+      local border_top    = "╭" .. string.rep("─", inner_width + 2) .. "╮"
+      local border_bottom = "╰" .. string.rep("─", inner_width + 2) .. "╯"
+
+      local virt = { { { border_top, "CritVimCommentBorder" } } }
+
+      local function push_row(text)
+        local pad = inner_width - vim.fn.strdisplaywidth(text)
+        if pad < 0 then pad = 0 end
+        table.insert(virt, {
+          { "│ ",                        "CritVimCommentBorder" },
+          { text,                        "CritVimCommentBody" },
+          { string.rep(" ", pad) .. " ", "CritVimCommentBody" },
+          { "│",                         "CritVimCommentBorder" },
+        })
+      end
+
+      for _, s in ipairs(wrapped_author) do push_row(s) end
+      if #wrapped_body > 0 then push_row("") end   -- spacer under header
+      for _, s in ipairs(wrapped_body) do push_row(s) end
+
+      table.insert(virt, { { border_bottom, "CritVimCommentBorder" } })
+
+      vim.api.nvim_buf_set_extmark(buf, M._ns, end_l, 0, {
+        virt_lines = virt,
+        virt_lines_above = false,
+        priority = 50,
       })
     end
   end
