@@ -934,6 +934,41 @@ end
 
 -- ---------- rendering ----------
 
+-- Word-wrap `text` so no segment exceeds `width` display cells. Falls back
+-- to a hard character-boundary split for tokens that are longer than
+-- `width` on their own (e.g. a giant URL).
+local function wrap_line(text, width)
+  if vim.fn.strdisplaywidth(text) <= width then return { text } end
+
+  local out = {}
+  local cur = ""
+  local function push(s)
+    while vim.fn.strdisplaywidth(s) > width do
+      local n = 1
+      while n <= #s and vim.fn.strdisplaywidth(s:sub(1, n)) <= width do
+        n = n + 1
+      end
+      table.insert(out, s:sub(1, n - 1))
+      s = s:sub(n)
+    end
+    if #s > 0 then table.insert(out, s) end
+  end
+
+  for _, w in ipairs(vim.split(text, " ", { plain = true })) do
+    if cur == "" then
+      cur = w
+    elseif vim.fn.strdisplaywidth(cur .. " " .. w) <= width then
+      cur = cur .. " " .. w
+    else
+      push(cur)
+      cur = w
+    end
+  end
+  if cur ~= "" then push(cur) end
+
+  return out
+end
+
 function M._refresh_signs_for_file(file)
   local bufs = M.session and M.session.file_bufs[file]
   if not bufs then return end
@@ -971,45 +1006,55 @@ function M._refresh_signs_for_file(file)
 
       -- Bordered comment box rendered as virt_lines below the range.
       -- Padded to a consistent inner width so the box background reads
-      -- as one solid contrasting card.
+      -- as one solid contrasting card. Long lines are word-wrapped at
+      -- `target_width` cells so nothing overflows the box.
       local body = c.body or ""
       local body_lines = vim.split(body, "\r?\n")
       local resolved_marker = c.resolved and "  ✓" or ""
       local author_line = "@" .. (c.author or "?") .. resolved_marker
 
-      local content = { author_line }
-      for _, bl in ipairs(body_lines) do table.insert(content, bl) end
+      local target_width = 76
+
+      local wrapped_author = wrap_line(author_line, target_width)
+      local wrapped_body = {}
+      for _, bl in ipairs(body_lines) do
+        local segs = wrap_line(bl, target_width)
+        if #segs == 0 then
+          table.insert(wrapped_body, "")
+        else
+          for _, seg in ipairs(segs) do table.insert(wrapped_body, seg) end
+        end
+      end
 
       local inner_width = 20  -- min
-      for _, ln in ipairs(content) do
-        inner_width = math.max(inner_width, vim.fn.strdisplaywidth(ln))
+      for _, s in ipairs(wrapped_author) do
+        inner_width = math.max(inner_width, vim.fn.strdisplaywidth(s))
       end
-      if inner_width > 100 then inner_width = 100 end
+      for _, s in ipairs(wrapped_body) do
+        inner_width = math.max(inner_width, vim.fn.strdisplaywidth(s))
+      end
+      if inner_width > target_width then inner_width = target_width end
 
       local border_top    = "╭" .. string.rep("─", inner_width + 2) .. "╮"
       local border_bottom = "╰" .. string.rep("─", inner_width + 2) .. "╯"
 
-      local virt = {
-        { { border_top, "CritVimCommentBorder" } },
-      }
-      for i, ln in ipairs(content) do
-        local pad = inner_width - vim.fn.strdisplaywidth(ln)
+      local virt = { { { border_top, "CritVimCommentBorder" } } }
+
+      local function push_row(text)
+        local pad = inner_width - vim.fn.strdisplaywidth(text)
         if pad < 0 then pad = 0 end
         table.insert(virt, {
-          { "│ ",                       "CritVimCommentBorder" },
-          { ln,                         "CritVimCommentBody" },
+          { "│ ",                        "CritVimCommentBorder" },
+          { text,                        "CritVimCommentBody" },
           { string.rep(" ", pad) .. " ", "CritVimCommentBody" },
-          { "│",                        "CritVimCommentBorder" },
+          { "│",                         "CritVimCommentBorder" },
         })
-        -- Blank spacer under the author header for breathing room.
-        if i == 1 and #content > 1 then
-          table.insert(virt, {
-            { "│ ",                                "CritVimCommentBorder" },
-            { string.rep(" ", inner_width + 1),    "CritVimCommentBody" },
-            { "│",                                 "CritVimCommentBorder" },
-          })
-        end
       end
+
+      for _, s in ipairs(wrapped_author) do push_row(s) end
+      if #wrapped_body > 0 then push_row("") end   -- spacer under header
+      for _, s in ipairs(wrapped_body) do push_row(s) end
+
       table.insert(virt, { { border_bottom, "CritVimCommentBorder" } })
 
       vim.api.nvim_buf_set_extmark(buf, M._ns, end_l, 0, {
