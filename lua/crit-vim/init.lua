@@ -1057,9 +1057,14 @@ function M._refresh_signs_for_file(file)
 
       table.insert(virt, { { border_bottom, "CritVimCommentBorder" } })
 
-      vim.api.nvim_buf_set_extmark(buf, M._ns, end_l, 0, {
+      -- Nvim clips virt_lines rendered below the last buffer line. Flip
+      -- the anchor to above `start_l` when the comment sits on the last
+      -- line so the box stays visible.
+      local at_last_line = (end_l == line_count - 1)
+      local anchor_row   = at_last_line and start_l or end_l
+      vim.api.nvim_buf_set_extmark(buf, M._ns, anchor_row, 0, {
         virt_lines = virt,
-        virt_lines_above = false,
+        virt_lines_above = at_last_line,
         priority = 50,
       })
     end
