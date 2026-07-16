@@ -123,7 +123,7 @@ EOF
 crit-vim: `crit` (tomasz-tomczyk/crit) is not installed.
   Install with:  brew install crit
   or:            go install github.com/tomasz-tomczyk/crit/cmd/crit@latest
-  crit-vim uses crit as the review-session backend since v0.2.
+  crit-vim uses crit as the review-session backend since 0.2.0.
 EOM
     exit 2
   }
@@ -283,7 +283,12 @@ cmd_status() {
 # ---------- doctor ----------
 
 cmd_doctor() {
-  echo "crit-vim doctor"
+  local self_dir vfile
+  self_dir=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
+  vfile="$self_dir/VERSION"
+  local version="(unknown)"
+  [[ -f "$vfile" ]] && version=$(cat "$vfile" | tr -d '[:space:]')
+  echo "crit-vim doctor (crit-vim $version)"
   echo "  \$NVIM=${NVIM:-(unset)}"
   echo "  \$CRIT_VIM_SOCKET=${CRIT_VIM_SOCKET:-(unset)}"
   if command -v crit >/dev/null 2>&1; then

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for crit-vim (v0.2+ — crit-server-backed).
+# End-to-end smoke test for crit-vim (0.2.0+ — crit-server-backed).
 #
 # Prereqs: crit >= 0.18 on $PATH.
 #
