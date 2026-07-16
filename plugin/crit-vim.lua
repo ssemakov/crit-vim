@@ -65,6 +65,24 @@ vim.api.nvim_create_user_command("CritFinish", function() crit.finish() end,
 vim.api.nvim_create_user_command("CritCancel", function() crit.cancel() end,
   { desc = "crit-vim: cancel review; agent exits with code 1" })
 
+vim.api.nvim_create_user_command("CritReply", function() crit.reply_at_cursor() end,
+  { desc = "crit-vim: reply to the comment under cursor" })
+
+vim.api.nvim_create_user_command("CritEditReply", function() crit.edit_reply_at_cursor() end,
+  { desc = "crit-vim: edit one of the replies on the comment under cursor" })
+
+vim.api.nvim_create_user_command("CritDeleteReply", function() crit.delete_reply_at_cursor() end,
+  { desc = "crit-vim: delete one of the replies on the comment under cursor" })
+
+vim.api.nvim_create_user_command("CritResolve", function() crit.resolve_at_cursor() end,
+  { desc = "crit-vim: mark the comment under cursor as resolved" })
+
+vim.api.nvim_create_user_command("CritUnresolve", function() crit.unresolve_at_cursor() end,
+  { desc = "crit-vim: mark the comment under cursor as unresolved" })
+
+vim.api.nvim_create_user_command("CritToggleResolved", function() crit.toggle_show_resolved() end,
+  { desc = "crit-vim: show or hide resolved comments" })
+
 -- ---------- <Plug> mappings ----------
 -- These are the plugin's public keymap API. Users bind them to whatever
 -- keys they like (see README). <Plug> targets can't be typed directly so
@@ -90,3 +108,11 @@ end, { expr = true, desc = "crit-vim: comment on selection" })
 vim.keymap.set("n", "<Plug>(CritCommentLine)", function()
   crit.comment_line(vim.api.nvim_win_get_cursor(0)[1])
 end, { desc = "crit-vim: comment on current line" })
+
+vim.keymap.set("n", "<Plug>(CritReply)", function()
+  crit.reply_at_cursor()
+end, { desc = "crit-vim: reply to comment under cursor" })
+
+vim.keymap.set("n", "<Plug>(CritResolve)", function()
+  crit.toggle_resolved_at_cursor()
+end, { desc = "crit-vim: toggle resolved on comment under cursor" })

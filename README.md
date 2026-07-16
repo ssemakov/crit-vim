@@ -2,31 +2,57 @@
 
 ![crit-vim in Neovim](img/nvim-screenshot.png)
 
-Review an agent's diff inside your running Neovim and return the comments back
-as JSON. A vim-native frontend for the agent/human review handshake, with the
-JSON shape kept compatible with [tomasz-tomczyk/crit](https://github.com/tomasz-tomczyk/crit)
+Nvim-native client for [tomasz-tomczyk/crit](https://github.com/tomasz-tomczyk/crit).
+Attaches to a running crit daemon, gives you a vim buffer per changed file
+with inline comment cards, and rides on crit's schema for threads, resolve
+state, multi-round tracking, PR sync, and share.
+
+## Why
+
+crit ships an excellent TUI and browser UI, and its schema handles the hard
+parts (rounds, threads, resolve, atomic writes, per-branch persistence,
+GitHub sync). But not everyone wants to leave Neovim to review a diff. This
+plugin puts the whole review inside your existing nvim while delegating all
+session state to the crit daemon — so both the browser and nvim stay in
+sync in real time via SSE, and you don't lose comments when nvim restarts.
 
 ## Features
 
-- Single review round.
-- Line/range comments only (no replies, no resolve toggle, no scopes).
-- Diff via `:diffthis` between the working tree and `git show <base>:<path>`.
-- Self-contained storage in `$TMPDIR/crit-vim/<session>`. No daemon.
+- One nvim tab per changed file with the base as a `:diffthis` left pane.
+- Comments render as bordered floating cards with a colored gutter bar.
+- Multi-line word-wrap; threaded replies render inline; resolved comments
+  can be dimmed with strikethrough or hidden entirely.
+- Real-time sync: comments authored in a browser tab or with `crit comment`
+  appear in your nvim within milliseconds (SSE).
+- Threads, resolve toggle, multi-round, PR-sync (via `crit pull`/`push`),
+  share (via `crit share`) — all available because crit handles them.
 
 ## Install
 
-The plugin is a Neovim runtime directory and a single shell script.
+**1. Install crit (the daemon).**
 
-**1. Wire up the plugin.**
+```sh
+brew install crit
+# or:
+go install github.com/tomasz-tomczyk/crit/cmd/crit@latest
+```
 
-LazyVim / lazy.nvim — drop a file in `~/.config/nvim/lua/plugins/crit-vim.lua`:
+**2. Install the plugin.**
+
+lazy.nvim / LazyVim — drop this in `~/.config/nvim/lua/plugins/crit-vim.lua`:
 
 ```lua
 return {
   {
     dir = "/path/to/crit-vim",
     name = "crit-vim",
-    lazy = false,  -- need VimEnter to register the socket on startup
+    lazy = false, -- need VimEnter to register the socket on startup
+    keys = {
+      { "<leader>C",  "<Plug>(CritComment)",     mode = { "n", "x" }, desc = "Crit: comment" },
+      { "<leader>CC", "<Plug>(CritCommentLine)", mode = "n",          desc = "Crit: comment line" },
+      { "<leader>Cr", "<Plug>(CritReply)",       mode = "n",          desc = "Crit: reply" },
+      { "<leader>Cx", "<Plug>(CritResolve)",     mode = "n",          desc = "Crit: toggle resolve" },
+    },
   },
 }
 ```
@@ -37,95 +63,72 @@ Classic vim runtime:
 set runtimepath+=/path/to/crit-vim
 ```
 
-**2. Put the CLI on `$PATH`.**
+**3. Put the CLI on `$PATH`.**
 
 ```sh
-ln -s /path/to/crit-vim/bin/crit-vim ~/bin/crit-vim   # or any $PATH dir
+ln -s /path/to/crit-vim/bin/crit-vim ~/bin/crit-vim
 ```
 
-**3. Verify.**
-
-Restart nvim, open it in a git repo, then in another tmux pane:
+**4. Verify.**
 
 ```sh
 crit-vim doctor
 ```
 
-The output should list your nvim's socket under `registry`.
+Should list your nvim's socket + crit binary + session-file path.
 
-Requires: Neovim 0.10+, `git`, `uuidgen`, `bash`, `jq` _or_ `python3`.
+Requires: Neovim 0.10+, `git`, `curl`, `python3`, `bash`, `crit` >= 0.18.
 
 ## Usage
 
 You need two things:
 
-1. **Your nvim**, open in the repo of interest, with the plugin loaded. It
-   registers its socket on `VimEnter` keyed by repo root.
-2. **A shell** where you (or the agent) can run `crit-vim review`. It can be
-   anywhere with `$PATH` set: a sibling tmux pane, a separate terminal window,
-   an IDE terminal, `:terminal` inside the same nvim, an SSH session sharing
-   the socket — anything that resolves to the same `git rev-parse
---show-toplevel` will find the right nvim via the per-repo registry.
-
-In the shell:
+1. **Your nvim**, open in the repo of interest, with the plugin loaded.
+2. **A shell** where you (or the agent) can run `crit-vim review`.
 
 ```sh
-crit-vim review --base HEAD
+crit-vim review
 ```
 
-That blocks the shell. In nvim, **one diff tab opens per changed file** (tracked
-modifications + untracked-but-present files, treated as added). A persistent
-**sidebar** appears at the left of every review tab showing the file list with
-comment counts — `<CR>` on a row jumps to that file's diff, `q` closes the
-sidebar (`:CritSidebar` to reopen), `R` refreshes. The cursor in the sidebar
-auto-tracks the current tab. `gt`/`gT` also work for plain tab nav.
+That spawns a crit daemon (if none is running for this cwd+branch), waits
+for it to become ready, tells nvim to attach, and blocks until you finish
+the review (either from nvim via `:CritFinish` or from a browser tab).
+
+In nvim, one diff tab opens per changed file, with a sidebar on the left
+listing files and comment counts. `<CR>` on a sidebar row jumps to that
+file, `q` closes the sidebar, `R` refreshes.
 
 ### Authoring comments
 
-crit-vim exposes two `<Plug>` mappings and no default `<leader>` bindings —
-you pick the keys. Bind them to whatever you like:
-
-```lua
--- lazy.nvim spec
-keys = {
-  { "<leader>C",  "<Plug>(CritComment)",     mode = { "n", "x" }, desc = "Crit: comment (motion / visual)" },
-  { "<leader>CC", "<Plug>(CritCommentLine)", mode = "n",          desc = "Crit: comment current line" },
-}
-```
-
-Or, if you don't want to write keys yourself:
-
-```lua
-require("crit-vim").setup({ default_keys = true })  -- binds <leader>C{,C}
-```
-
-`<leader>C` is only a suggestion — any key works. `<Plug>(CritComment)` is a
-vim operator (works with any motion, text-object, or visual selection);
-`<Plug>(CritCommentLine)` is a linewise convenience. They silently no-op
-outside a review buffer, so binding them globally is safe.
-
-With the suggested `<leader>C{,C}` bindings:
+Pick a range, then drop into a floating comment buffer:
 
 | To comment on...                 | Do this                                                         |
 | -------------------------------- | --------------------------------------------------------------- |
 | the current line                 | `<leader>CC`                                                    |
 | a paragraph                      | `<leader>Cap` (operator + text-object)                          |
 | this line and the next 4         | `<leader>C4j` (operator + count + motion)                       |
-| down to the next blank line      | `<leader>C}`                                                    |
-| inside quotes / brackets / a tag | `<leader>Ci"` / `<leader>Ci(` / `<leader>Cit`                   |
-| an arbitrary visual selection    | `V` → move → `<leader>C` (linewise) or `v` → move → `<leader>C` |
+| a visual selection               | `V` / `v` → move → `<leader>C`                                  |
 | an explicit line range           | `:42,55CritComment`                                             |
 
-The saved comment is anchored to the **line range** the motion covered
-(upstream's schema is line-based); the exact selected text is preserved in
-the comment's `quote` field.
+Inside the floating buffer:
 
-Inside the floating buffer (real vim — operators, registers, clipboard, etc.):
+| Keys                                | Behaviour              |
+| ----------------------------------- | ---------------------- |
+| `<C-s>` (normal+insert), `:w`, `ZZ` | save the comment       |
+| `q` (normal), `:q!`                 | cancel without saving  |
 
-| Keys / Command                      | Behaviour                  |
-| ----------------------------------- | -------------------------- |
-| `<C-s>` (normal+insert), `:w`, `ZZ` | save the comment and close |
-| `q` (normal), `:q!`                 | cancel without saving      |
+### Threads + resolve
+
+| Command / Keymap        | Behaviour                                                        |
+| ----------------------- | ---------------------------------------------------------------- |
+| `:CritReply`            | Reply to the comment under the cursor (opens the comment buffer) |
+| `:CritResolve`          | Toggle resolved state on the comment under the cursor            |
+| `:CritToggleResolved`   | Show or hide resolved comments in this session                   |
+
+Reply threads render inside the same bordered card as the parent comment,
+separated by a horizontal divider and prefixed with `↳ @author`. Resolved
+comments render dimmed with a strikethrough body (or hide entirely when
+`:CritToggleResolved` is off).
 
 ### Managing comments
 
@@ -139,29 +142,68 @@ Inside the floating buffer (real vim — operators, registers, clipboard, etc.):
 
 ### Editing during review
 
-The right side of every modified or added file is the **real working-tree
-file** — fully editable with `:w` writing through to disk. The left side
-(base content) and deleted files stay read-only scratch buffers.
-
-Small fixes don't have to round-trip through the agent: edit inline, save,
-and the agent will see the changes when it re-reads the JSON.
+The right side of every modified or added file is the real working-tree
+file. Edits with `:w` write through to disk; the agent (and any other
+review surface) sees the change on next round.
 
 ### Submitting the review
 
-| Command       | Behaviour                                                                                                                                                                   |
-| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `:CritFinish` | Auto-save any modified review files, then submit. The blocked agent unblocks and gets the JSON on stdout. Aborts with an error if a save fails (e.g. read-only filesystem). |
-| `:CritCancel` | Abort the review. Prompts y/N if any review file has unsaved edits and discards them on confirmation. The agent exits with code 1.                                          |
+| Command       | Behaviour                                                                 |
+| ------------- | ------------------------------------------------------------------------- |
+| `:CritFinish` | POST `/api/finish`, stop the daemon; the blocked `crit-vim review` exits. |
+| `:CritCancel` | Stop the daemon without finishing.                                        |
 
-We don't bind `<leader>cf`/`<leader>cs` etc. as global shortcuts because they
-collide with LazyVim's `<leader>c{letter}` group. Bind your own if you like:
+## Cross-surface parity
+
+Because the daemon is authoritative and both surfaces subscribe to
+`/api/events` (SSE), you can:
+
+- Author a comment in nvim; a colleague sees it appear in the browser tab.
+- Have the agent `crit comment ...` from another shell; nvim renders it live.
+- `crit pull <PR#>` to import review comments from a GitHub PR — they show
+  up in nvim without an nvim reload.
+
+## CLI commands
+
+| Command                        | What it does                                            |
+| ------------------------------ | ------------------------------------------------------- |
+| `crit-vim review [--base REF]` | ensure crit daemon, attach nvim, block on `:CritFinish` |
+| `crit-vim status`              | proxy to `crit status --json`                           |
+| `crit-vim doctor`              | diagnose nvim socket + crit binary + session file       |
+
+`crit-vim review` accepts `--open-browser` to also open a browser tab
+alongside nvim (default: nvim only).
+
+## `<Plug>` API
+
+The plugin exposes these `<Plug>` mappings; bind them to whatever keys
+you prefer.
+
+| Mapping                       | Modes | Purpose                          |
+| ----------------------------- | ----- | -------------------------------- |
+| `<Plug>(CritComment)`         | n, x  | operator + visual comment        |
+| `<Plug>(CritCommentLine)`     | n     | comment on current line          |
+| `<Plug>(CritReply)`           | n     | reply to comment under cursor    |
+| `<Plug>(CritResolve)`         | n     | toggle resolved                  |
+
+They silently no-op outside an active review, so binding them globally is
+safe. Or shortcut:
 
 ```lua
-vim.keymap.set("n", "<leader>cF", "<cmd>CritFinish<cr>")
-vim.keymap.set("n", "<leader>cX", "<cmd>CritDelete<cr>")
+require("crit-vim").setup({ default_keys = true })
+-- binds <leader>C, <leader>CC (comment + comment-line) only.
 ```
 
-## Agent integration (Claude Code, Codex)
+## Socket discovery
+
+The CLI looks for your nvim in this order:
+
+1. `--socket <path>`
+2. `$CRIT_VIM_SOCKET`
+3. `$NVIM` (set by nvim for processes spawned from `:terminal`)
+4. `~/.crit-vim/sockets/<sha256(repo_root)>` (registry the plugin maintains)
+
+## Agent integration
 
 Skill manifests live under `integrations/`:
 
@@ -170,91 +212,37 @@ integrations/claude-code/skills/crit-vim/SKILL.md
 integrations/codex/skills/crit-vim/SKILL.md
 ```
 
-To enable, copy or symlink the `crit-vim/` directory into your agent's
-skills directory (e.g. `~/.claude/skills/` for Claude Code,
-`~/.codex/skills/` for Codex). After that, the agent can invoke `crit-vim`
-and will follow the documented loop: block on `crit-vim review`, read JSON,
-edit files, optionally start another round.
-
-## CLI commands
-
-| Command                        | What it does                                        |
-| ------------------------------ | --------------------------------------------------- |
-| `crit-vim review [--base REF]` | open a review and block on `:CritFinish`            |
-| `crit-vim status`              | print the JSON of the most recently finished review |
-| `crit-vim doctor`              | diagnose nvim socket discovery                      |
+Copy or symlink `crit-vim/` into your agent's skills directory. The agent
+runs `crit-vim review`, blocks until you `:CritFinish`, reads the JSON,
+edits files, optionally starts another round with `crit-vim review`.
 
 ## Troubleshooting
 
-- **Only one file shows up.** Make sure the agent's new files are either
-  staged (`git add`) or present in the worktree as untracked — crit-vim
-  picks up both. Ignored files (`.gitignore`) are skipped. If you closed
-  diff tabs with `<C-w>o`, run `:CritReopen`.
-- **A stale review blocks new ones.** Starting a new `crit-vim review`
-  auto-cancels the prior session in nvim. If a bash CLI is stuck in the
-  background, kill it; the new review's JSON is what counts.
+- **`crit-vim: crit ... is not installed`** — install crit (`brew install
+  crit`).
+- **`crit daemon /api/session never became ready`** — the daemon crashed
+  during startup. Check `~/.crit/sessions/<key>.log`.
+- **`crit-vim: cannot find a running nvim`** — start nvim in the repo, or
+  export `CRIT_VIM_SOCKET`. Run `crit-vim doctor` for details.
 
-## Socket discovery
+## How it hangs together
 
-The CLI looks for the user's nvim in this order:
-
-1. `--socket <path>` flag
-2. `$CRIT_VIM_SOCKET`
-3. `$NVIM` (set by nvim for processes spawned from `:terminal`)
-4. `~/.crit-vim/sockets/<sha256(repo_root)>` (registry the plugin maintains)
-
-For nvim-in-tmux-pane-A + agent-in-tmux-pane-B, only the registry helps.
-It's written on `VimEnter` and removed on `VimLeavePre`. One nvim per repo:
-just works. If you run two nvims in the same repo, last-write wins — set
-`$CRIT_VIM_SOCKET` or pass `--socket` to disambiguate.
-
-## Output JSON
-
-Kept shape-compatible with upstream `crit status --code`:
-
-```json
-{
-  "files": {
-    "path/to/file.go": {
-      "status": "modified",
-      "comments": [
-        {
-          "id": "8b13a7f4-...",
-          "start_line": 42,
-          "end_line": 42,
-          "side": "right",
-          "scope": "line",
-          "body": "this should handle EOF",
-          "resolved": false,
-          "resolved_round": 0,
-          "replies": [],
-          "created_at": "2026-05-12T09:14:00Z",
-          "author": "you@example.com",
-          "quote": "for {",
-          "anchor": {
-            "before": ["...", "...", "..."],
-            "body": ["for {"],
-            "after": ["...", "...", "..."],
-            "start_line": 42,
-            "end_line": 42
-          }
-        }
-      ]
-    }
-  },
-  "review_comments": []
-}
-```
-
-We own this file (in `$TMPDIR/crit-vim/<sid>/comments.json`) for now. We may later
-switch to the upstream daemon.
+- Session state lives in `~/.crit/reviews/<key>/review.json` (crit owns this).
+- Daemon serves it at `http://127.0.0.1:<port>/api/*`.
+- Plugin reads `review.json` for comment data (atomic, cheap) and posts to
+  `/api/*` for writes. Any change (from us, the browser, or `crit comment`)
+  fires SSE `comments-changed`; the plugin re-reads `review.json` and
+  re-renders.
+- Per-branch review persistence is inherited from crit — kill nvim and
+  restart, `crit-vim review` re-attaches to the same review with all your
+  comments intact.
 
 ## Smoke test
-
-`test/smoke.sh` builds a throwaway repo, starts a headless nvim with the
-plugin, runs `crit-vim review` against it from a background shell, plants a
-comment via RPC, calls `:CritFinish`, and checks the resulting JSON.
 
 ```sh
 ./test/smoke.sh
 ```
+
+Spawns a headless nvim, wires up an ephemeral git repo, runs `crit-vim
+review`, plants a comment via `/api/file/comments`, `:CritFinish`, and
+asserts the returned JSON.

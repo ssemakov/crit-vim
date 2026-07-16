@@ -1,17 +1,17 @@
 ---
 name: crit-vim
-description: Review code changes inside the user's running Neovim using crit-vim. Use when the user asks to review your changes "in vim", "with crit-vim", or whenever you want structured inline feedback on edits via the vim review surface.
-allowed-tools: Bash(crit-vim:*), Read, Edit, MultiEdit, Grep, Glob
+description: Review code changes inside the user's running Neovim using crit-vim (attaches to a crit daemon; supports threaded replies + resolve). Use when the user asks to review your changes "in vim", "with crit-vim", or whenever you want structured inline feedback via the vim review surface.
+allowed-tools: Bash(crit-vim:*), Bash(crit:*), Read, Edit, MultiEdit, Grep, Glob
 argument-hint: "[--base REF]"
 ---
 
 # Review with crit-vim
 
-Review and revise code changes using `crit-vim` — a vim-native review loop. The user authors comments in their running Neovim; you read the resulting JSON and address each comment by editing files.
+Review and revise code changes using `crit-vim` — an nvim-native client for [tomasz-tomczyk/crit](https://github.com/tomasz-tomczyk/crit). The user authors comments (and reply threads) in Neovim; you read the resulting JSON and address each comment by editing files.
 
 ## Prerequisites
 
-`crit-vim` must be on `$PATH` and the user's Neovim must already be running with the crit-vim plugin loaded. Quick check:
+Both `crit` (the daemon binary) and `crit-vim` (the nvim client CLI) must be on `$PATH`, and the user's Neovim must be running with the crit-vim plugin loaded. Quick check:
 
 ```bash
 crit-vim doctor
@@ -26,51 +26,56 @@ If the doctor reports no reachable nvim, ask the user to open Neovim in the repo
 Run `crit-vim review` **in the background** using `run_in_background: true`:
 
 ```bash
-crit-vim review --base HEAD
+crit-vim review
 ```
 
-The command blocks until the user runs `:CritFinish` (or `:CritCancel`) in their nvim. While it's blocked, the user is reading your diff: one tab per changed file, plus a sidebar listing files with comment counts.
+`crit-vim review`:
+- spawns a `crit --no-open` daemon for this repo+branch (or attaches if one is already running),
+- tells nvim to attach to it, and
+- blocks until the user runs `:CritFinish` or `:CritCancel` in nvim (or hits Approve in a browser tab, if they opened one).
 
 Tell the user verbatim:
 
 > **"Review is open in your nvim. Drop comments on the diff, then `:CritFinish` when done."**
 
-**Do NOT proceed until the background task completes.** Do NOT poll. Do NOT do unrelated work — the user is engaged with your change. When the task completes, the exit code tells you what happened:
+**Do NOT proceed until the background task completes.** When the task completes, the exit code tells you what happened:
 
-- `0` → user ran `:CritFinish`. JSON is on stdout.
-- `1` → user ran `:CritCancel`, or the plugin errored. Read stderr; do not assume comments exist.
-- `2` → setup error (no reachable nvim, no diff vs base, plugin not loaded). Read stderr and relay to the user.
+- `0` → user finished the review. JSON is on stdout (via `crit comments --json`).
+- `1` → user cancelled, or the crit binary is missing.
+- `2` → setup error (no reachable nvim, daemon didn't come up). Read stderr and relay to the user.
 - `124` → `--timeout` elapsed. Treat as cancel.
 
 ## Step 2: Read the comments
 
-The completed `crit-vim review` prints the JSON to stdout. If you need to re-read it, `crit-vim status` re-prints the most recent finished review.
+The completed `crit-vim review` prints the JSON to stdout. If you need to re-read, run `crit comments --json`.
 
-Top-level shape:
+Top-level shape (crit v4 review file):
 
 ```json
 {
+  "branch": "feat/foo",
+  "base_ref": "abc123...",
+  "review_round": 2,
   "files": {
     "path/to/file.go": {
       "status": "modified",
       "comments": [
         {
-          "id": "8b13a7f4-...",
+          "id": "c_1df20f",
           "start_line": 42,
           "end_line": 42,
-          "side": "right",
+          "side": "",
           "scope": "line",
           "body": "this should handle EOF",
-          "resolved": false,
-          "author": "you@example.com",
           "quote": "for {",
-          "anchor": {
-            "before": ["..."],
-            "body":   ["for {"],
-            "after":  ["..."],
-            "start_line": 42,
-            "end_line": 42
-          }
+          "anchor": "for {",
+          "resolved": false,
+          "resolved_round": 0,
+          "replies": [
+            {"id": "rp_ab12", "body": "acknowledged, will fix", "author": "you", "created_at": "..."}
+          ],
+          "created_at": "...",
+          "updated_at": "..."
         }
       ]
     }
@@ -79,94 +84,94 @@ Top-level shape:
 }
 ```
 
-Treat every comment as actionable unless `resolved: true` (always `false` in this version — resolve is not yet implemented).
-
-<important if="a comment has a quote or anchor field">
-- `quote`: the verbatim text the reviewer selected. Focus your change on it rather than the whole line range.
-- `anchor`: the lines as they existed when the comment was placed (`before`/`body`/`after` give surrounding context). If you've already edited the file and line numbers have shifted, find the content by searching for `anchor.body` rather than trusting `start_line`/`end_line`.
-- `side: "right"` means the comment is on your proposed code (the working tree). `side: "left"` means the user commented on the base version — usually a question about why you removed/changed something.
-</important>
+Rules:
+- `resolved: true` → the comment thread is closed. Skip it unless the user asks otherwise.
+- `resolved: false` → actionable. Read the whole thread: `body` + every `replies[].body`. The latest reply often narrows or clarifies the ask.
+- `side: ""` (or `"right"`) → comment is on your proposed code.
+- `side: "old"` (or `"left"`) → comment is on the base version — usually a question about why you removed something.
+- `quote`: the verbatim text the user selected. Focus your change there.
+- `anchor`: (v4 crit) short snippet used for drift detection.
 
 ## Step 3: Address each comment
 
 For each unresolved comment:
 
-1. Read the comment body and `quote`/`anchor` for context.
+1. Read the comment + all replies.
 2. Edit the referenced file with `Edit` / `MultiEdit`.
-3. **There are no inline replies in this version.** Acknowledge by changing the code — the user will see the new state in the next round.
+3. **Optionally post a reply** so the user knows what you did:
 
-If there are zero comments, the user has approved your change. Stop and inform them.
+    ```bash
+    crit comment --reply-to <comment_id> --author 'Claude' 'Extracted into helper; see line 88.'
+    ```
 
-## Step 4: Next round (optional)
+    Add `--resolve` to also mark the thread resolved in one call:
 
-After addressing comments, run `crit-vim review` **in the background** again to start a fresh round:
+    ```bash
+    crit comment --reply-to <comment_id> --resolve --author 'Claude' 'Fixed in this round.'
+    ```
+
+If there are zero unresolved comments, the user has approved. Stop and inform them.
+
+## Step 4: Next round
+
+After addressing comments, run `crit-vim review` **in the background** again:
 
 ```bash
-crit-vim review --base HEAD
+crit-vim review
 ```
 
-The plugin auto-cancels any stale session and opens a new review showing your latest changes. Tell the user:
+The plugin re-attaches to the same crit session (same key = cwd + branch), so the user sees your updated diff **with the previous round's comments and your replies still in place**. Tell the user:
 
-> **"Changes applied. `:CritFinish` again when ready, or `:CritCancel` if everything looks good."**
+> **"Changes applied. `:CritFinish` when ready, or `:CritCancel` if everything looks good."**
 
-Loop back to Step 2. The review is approved when the user either cancels or finishes with no comments.
+Loop back to Step 2.
 
 ## Notes
 
-- **Never modify files while the review is open** — the working tree is what the user is reviewing.
-- **`--base`** defaults to `HEAD`. Pass a different ref to review changes since an earlier commit.
+- **Never modify files while the review is open** — the working tree is what the user is reviewing (the plugin diffs against `base_ref`, but the right side is the live file).
+- **`--base`** defaults to auto-detection (crit chooses based on VCS state). Pass `--base REF` to override.
 - **Files not yet committed**: tracked modifications + untracked-but-present files (treated as added) both show up. The user does not need to `git add`.
+- **Comments authored via `crit comment`** appear in nvim live via SSE — no need to restart the review.
 
 ---
 
 ## Reference
 
-### Subcommands
+### CLI subcommands
 
 ```bash
-crit-vim review [--base REF] [--wait|--no-wait] [--timeout SECS] [--socket PATH]
-crit-vim status
+crit-vim review [--base REF] [--timeout SECS] [--socket PATH] [--open-browser]
+crit-vim status                                # proxy to `crit status --json`
 crit-vim doctor
 ```
 
-`crit-vim review` flags:
+Companion `crit comment` (from tomasz-tomczyk/crit, headless):
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--base REF` | `HEAD` | Git ref to diff against. |
-| `--wait` / `--no-wait` | `--wait` | Block on `:CritFinish` (default) or print the session dir and return. |
-| `--timeout SECS` | `14400` (4h) | Max time to block. |
-| `--socket PATH` | — | Override nvim socket discovery. |
-| `--code` / `--json` | — | Accepted for compatibility; output is always crit-shape. |
+```bash
+crit comment <file>:<line>[-end] '<body>'      # add a line comment
+crit comment --reply-to <id> '<body>'          # reply
+crit comment --reply-to <id> --resolve '<body>' # reply + resolve
+crit comments --json                            # list all
+```
 
-### Comment fields
+### Comment shape
 
-| Field | Type | Notes |
-|---|---|---|
-| `id` | string | UUIDv4. Stable across rounds. |
-| `start_line` / `end_line` | int | 1-based line range. |
-| `side` | string | `"right"` (working tree) or `"left"` (base). |
-| `scope` | string | Always `"line"` in v0. |
-| `body` | string | User-authored. Markdown allowed; default to plain-text reading. |
-| `resolved` / `resolved_round` | bool / int | Always `false` / `0` in v0. |
-| `replies` | array | Always `[]` in v0. |
-| `created_at` | string | ISO-8601 UTC. |
-| `author` | string | `git config user.email` of the reviewer. |
-| `quote` | string | Verbatim text the user selected. |
-| `anchor` | object | `{before, body, after, start_line, end_line}` for drift recovery. |
-
-The top-level `review_comments` array is always empty in v0.
+| Field | Notes |
+|---|---|
+| `id` | e.g. `c_1df20f`. Stable across rounds. |
+| `start_line` / `end_line` | 1-based. |
+| `side` | `""` (right / new) or `"old"` (left / base). |
+| `scope` | `"line"`, `"file"`, or `"review"`. |
+| `body` | Markdown allowed. |
+| `resolved` / `resolved_round` | Skip if `resolved:true`. |
+| `replies` | Array of `{id, body, author, created_at}`. |
+| `quote` | Verbatim selected text — focus here. |
+| `anchor` | Short snippet for drift detection. |
 
 ### Socket discovery
 
 `crit-vim` finds the user's nvim in this order: `--socket` flag → `$CRIT_VIM_SOCKET` → `$NVIM` → registry at `~/.crit-vim/sockets/<sha256(repo_root)>`. Run `crit-vim doctor` to see which step matched.
 
-### Not supported in v0
+### Multi-round
 
-Don't try to use these — they're deliberate omissions:
-
-- `crit-vim comment` (no programmatic comment authoring)
-- Inline replies, resolve / unresolve
-- File-scope or review-scope comments
-- GitHub PR sync, share / unpublish, plan-review mode
-- Multi-round in one invocation — re-run `crit-vim review` after editing
+Each `crit-vim review` invocation is a self-contained round. `:CritFinish` stops the daemon; the next `crit-vim review` reattaches to the same review file (per-branch persistence) so previous rounds' comments and replies are still visible alongside the fresh diff.
