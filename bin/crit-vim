@@ -166,24 +166,36 @@ EOM
 
   if [[ "$spawn" -eq 1 ]]; then
     # Spawn crit daemon in the background. `--no-open` because nvim is the UI.
+    # Capture stderr so we can surface it if the daemon dies or is slow.
+    local crit_log="/tmp/crit-vim.daemon.$$.log"
     local crit_args=(--no-open --quiet)
     if [[ -n "$base" ]]; then
       crit_args+=(--range "$base..HEAD")
     fi
-    ( cd "$repo" && crit "${crit_args[@]}" ) >/dev/null 2>&1 &
+    ( cd "$repo" && crit "${crit_args[@]}" ) >"$crit_log" 2>&1 &
     CRIT_SPAWNED_PID=$!
 
-    # Wait for the session file to appear (max 10s).
+    # Wait for the session file to appear (max 60s; large repos + fresh
+    # `crit` cache can take a while to compute the initial diff).
     local waited=0
-    while [[ ! -f "$session_file" ]] && [[ $waited -lt 100 ]]; do
+    while [[ ! -f "$session_file" ]] && [[ $waited -lt 600 ]]; do
       sleep 0.1
       waited=$((waited + 1))
-      # If crit died before writing the session file, bail.
       if ! kill -0 "$CRIT_SPAWNED_PID" 2>/dev/null; then
-        die "crit daemon exited before becoming ready (see 'crit status')"
+        echo "crit-vim: crit daemon exited before becoming ready" >&2
+        [[ -s "$crit_log" ]] && { echo "--- crit output ---" >&2; cat "$crit_log" >&2; }
+        rm -f "$crit_log"
+        exit 2
       fi
     done
-    [[ -f "$session_file" ]] || die "crit daemon did not become ready in 10s"
+    if [[ ! -f "$session_file" ]]; then
+      echo "crit-vim: crit daemon did not become ready in 60s" >&2
+      [[ -s "$crit_log" ]] && { echo "--- crit output ---" >&2; cat "$crit_log" >&2; }
+      cleanup_spawned_daemon
+      rm -f "$crit_log"
+      exit 2
+    fi
+    rm -f "$crit_log"
   fi
 
   # Read the session entry so nvim knows where to attach.
@@ -230,6 +242,27 @@ print(json.dumps({
   # luaeval is finicky about the marshalled string; base64 it.
   local args_b64
   args_b64=$(printf '%s' "$args_json" | base64 | tr -d '\n')
+
+  # Guard against a stale plugin load: v0.2.0+ exposes start_review_v2.
+  # If it's missing, the user's nvim is running an older plugin cached from
+  # a previous branch — tell them how to fix it instead of dumping a
+  # `nil value` traceback.
+  local has_v2
+  has_v2=$(nvim --server "$sock" --remote-expr \
+    "luaeval('(type(require\"crit-vim\".start_review_v2) == \"function\") and 1 or 0')" \
+    2>/dev/null || echo 0)
+  if [[ "$has_v2" != "1" ]]; then
+    cat >&2 <<'EOM'
+crit-vim: the running nvim has an older crit-vim plugin loaded.
+  crit-vim 0.2.0+ requires the plugin exposing `start_review_v2`.
+  Fix:
+    - Make sure the plugin dir is on the branch that ships this CLI:
+        git -C <plugin-dir> pull --ff-only
+    - Reload the plugin in nvim (lazy.nvim):  :Lazy reload crit-vim
+      Or just restart nvim.
+EOM
+    exit 2
+  fi
 
   if ! nvim --server "$sock" --remote-expr \
         "luaeval('require\"crit-vim\".start_review_v2(vim.json.decode(vim.base64.decode(_A)))', '$args_b64')" \
@@ -332,6 +365,15 @@ cmd_doctor() {
     echo "  → would use: $resolved"
     if nvim_reachable "$resolved"; then
       echo "    reachable: yes"
+      local has_v2
+      has_v2=$(nvim --server "$resolved" --remote-expr \
+        "luaeval('(type(require\"crit-vim\".start_review_v2) == \"function\") and 1 or 0')" \
+        2>/dev/null || echo 0)
+      if [[ "$has_v2" == "1" ]]; then
+        echo "    plugin: 0.2.0+ (has start_review_v2)"
+      else
+        echo "    plugin: OLDER than 0.2.0 — reload with :Lazy reload crit-vim"
+      fi
     else
       echo "    reachable: NO"
     fi
