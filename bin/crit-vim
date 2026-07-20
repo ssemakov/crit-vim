@@ -316,8 +316,22 @@ cmd_status() {
 # ---------- doctor ----------
 
 cmd_doctor() {
-  local self_dir vfile
-  self_dir=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
+  # Resolve $0 through any symlinks (~/bin/crit-vim -> repo/bin/crit-vim)
+  # so VERSION (sibling of the *real* script's dir) is found.
+  local script_real self_dir vfile
+  if script_real=$(readlink -f "$0" 2>/dev/null); then :
+  else
+    # macOS `readlink` has no -f; walk manually.
+    script_real="$0"
+    while [[ -L "$script_real" ]]; do
+      local link; link=$(readlink "$script_real")
+      case "$link" in
+        /*) script_real="$link" ;;
+         *) script_real="$(cd "$(dirname "$script_real")" && pwd)/$link" ;;
+      esac
+    done
+  fi
+  self_dir=$(cd "$(dirname "$script_real")/.." 2>/dev/null && pwd)
   vfile="$self_dir/VERSION"
   local version="(unknown)"
   [[ -f "$vfile" ]] && version=$(cat "$vfile" | tr -d '[:space:]')
