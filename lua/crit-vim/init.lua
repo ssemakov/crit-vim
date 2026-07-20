@@ -501,12 +501,16 @@ function M.start_review_v2(args)
       base .. "/api/session" })
     assert(vim.v.shell_error == 0, "GET /api/session failed: " .. tostring(out))
     local sess = vim.json.decode(out)
-    assert(sess and sess.files, "malformed /api/session response")
+    assert(sess, "malformed /api/session response")
 
     M.session.base = sess.base_ref
     M.session.branch = sess.branch
     M.session.review_round = sess.review_round or 1
-    for _, sf in ipairs(sess.files) do
+    -- crit returns `files: null` (decoded as vim.NIL, which is truthy) for an
+    -- empty review — normalize to {} so we don't ipairs() a userdata value.
+    local files = sess.files
+    if files == nil or files == vim.NIL then files = {} end
+    for _, sf in ipairs(files) do
       table.insert(M.session.files, session_file_to_file_info(sf))
     end
 
