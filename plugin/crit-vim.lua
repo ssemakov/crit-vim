@@ -83,6 +83,9 @@ vim.api.nvim_create_user_command("CritUnresolve", function() crit.unresolve_at_c
 vim.api.nvim_create_user_command("CritToggleResolved", function() crit.toggle_show_resolved() end,
   { desc = "crit-vim: show or hide resolved comments" })
 
+vim.api.nvim_create_user_command("CritVersion", function() crit.version() end,
+  { desc = "crit-vim: show plugin + CLI + session versions" })
+
 -- ---------- <Plug> mappings ----------
 -- These are the plugin's public keymap API. Users bind them to whatever
 -- keys they like (see README). <Plug> targets can't be typed directly so

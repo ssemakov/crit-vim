@@ -1530,6 +1530,55 @@ function M.list()
   vim.cmd("copen")
 end
 
+-- Locate the plugin's VERSION file by walking up from this init.lua.
+local function plugin_version()
+  local source = debug.getinfo(1, "S").source
+  if source:sub(1, 1) == "@" then source = source:sub(2) end
+  local plugin_dir = source:match("^(.*)/lua/crit%-vim/init%.lua$")
+  if not plugin_dir then return "(unknown)" end
+  local f = io.open(plugin_dir .. "/VERSION", "r")
+  if not f then return "(unknown)" end
+  local v = (f:read("*a") or ""):gsub("%s+", "")
+  f:close()
+  return v ~= "" and v or "(unknown)"
+end
+
+-- Print crit-vim plugin version + crit CLI version + (if a review is active)
+-- session summary + daemon health.
+function M.version()
+  local lines = { "crit-vim plugin: " .. plugin_version() }
+
+  local cli = vim.fn.systemlist({ "crit", "--version" })
+  if vim.v.shell_error == 0 and cli[1] then
+    table.insert(lines, "crit CLI:        " .. cli[1])
+  else
+    table.insert(lines, "crit CLI:        (not on $PATH)")
+  end
+
+  if M.session then
+    local base = string.format("http://%s:%d", M.session.host, M.session.port)
+    table.insert(lines, "")
+    table.insert(lines, string.format("session:         port=%d key=%s",
+      M.session.port, M.session.session_key or "?"))
+    table.insert(lines, string.format("branch/base:     %s → %s",
+      M.session.branch or "?", M.session.base or "?"))
+    table.insert(lines, string.format("round:           %d",
+      M.session.review_round or 1))
+    table.insert(lines, string.format("files:           %d", #(M.session.files or {})))
+    local health = vim.fn.system({ "curl", "-sS", "--max-time", "2", base .. "/api/health" })
+    if vim.v.shell_error == 0 then
+      table.insert(lines, "daemon health:   " .. (health or ""):gsub("%s+$", ""))
+    else
+      table.insert(lines, "daemon health:   (unreachable)")
+    end
+  else
+    table.insert(lines, "")
+    table.insert(lines, "session:         (no active review)")
+  end
+
+  vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
+end
+
 -- Optional convenience for users who don't want to write their own `keys`
 -- block. Call with `{ default_keys = true }` to bind <leader>C{,C} to the
 -- <Plug> targets globally.
