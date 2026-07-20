@@ -1547,6 +1547,11 @@ end
 -- session summary + daemon health.
 function M.version()
   local lines = { "crit-vim plugin: " .. plugin_version() }
+  -- Disk VERSION can disagree with the loaded module. 
+  -- Report the real runtime capability.
+  if type(M.start_review_v2) ~= "function" then
+    table.insert(lines, "  ⚠ loaded module is STALE — :Lazy reload crit-vim (or restart nvim)")
+  end
 
   local cli = vim.fn.systemlist({ "crit", "--version" })
   if vim.v.shell_error == 0 and cli[1] then
