@@ -1584,6 +1584,97 @@ function M.version()
   vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
 end
 
+-- Register user commands, autocmds, and <Plug> mappings.
+-- Called from plugin/crit-vim.lua at startup AND re-runs on `:Lazy reload`
+-- because it lives here in lua/ (plugin/ is startup-only).
+function M._register()
+  local group = vim.api.nvim_create_augroup("crit-vim", { clear = true })
+
+  vim.api.nvim_create_autocmd("VimEnter",
+    { group = group, callback = function() M.register_socket() end })
+  vim.api.nvim_create_autocmd("VimLeavePre",
+    { group = group, callback = function() M.unregister_socket() end })
+  vim.api.nvim_create_autocmd("DirChanged",
+    { group = group, callback = function() M.register_socket() end })
+  vim.api.nvim_create_autocmd("TabEnter",
+    { group = group, callback = function() M._reposition_sidebar_cursor() end })
+
+  local function cmd(name, fn, opts)
+    opts = opts or {}
+    -- nvim_create_user_command replaces silently, so this is idempotent
+    -- across reloads.
+    vim.api.nvim_create_user_command(name, fn, opts)
+  end
+
+  cmd("CritComment", function(opts)
+    if not M.session then
+      vim.notify("crit-vim: no active review", vim.log.levels.WARN)
+      return
+    end
+    if opts.range == 2 then
+      M.comment_range({ opts.line1 }, { opts.line2 })
+    else
+      M.comment_line(vim.api.nvim_win_get_cursor(0)[1])
+    end
+  end, { range = true, desc = "crit-vim: comment on line / range" })
+
+  cmd("CritEdit", function() M.edit_at_cursor() end,
+    { desc = "crit-vim: edit comment under cursor" })
+  cmd("CritDelete", function() M.delete_at_cursor() end,
+    { desc = "crit-vim: delete comment under cursor" })
+  cmd("CritReopen", function() M.reopen() end,
+    { desc = "crit-vim: rebuild diff tabs" })
+  cmd("CritSidebar", function() M.sidebar_toggle() end,
+    { desc = "crit-vim: toggle file sidebar" })
+  cmd("CritList", function() M.list() end,
+    { desc = "crit-vim: show comments in quickfix" })
+  cmd("CritFinish", function() M.finish() end,
+    { desc = "crit-vim: submit review" })
+  cmd("CritCancel", function() M.cancel() end,
+    { desc = "crit-vim: cancel review" })
+  cmd("CritReply", function() M.reply_at_cursor() end,
+    { desc = "crit-vim: reply to comment under cursor" })
+  cmd("CritEditReply", function() M.edit_reply_at_cursor() end,
+    { desc = "crit-vim: edit a reply on the comment under cursor" })
+  cmd("CritDeleteReply", function() M.delete_reply_at_cursor() end,
+    { desc = "crit-vim: delete a reply on the comment under cursor" })
+  cmd("CritResolve", function() M.resolve_at_cursor() end,
+    { desc = "crit-vim: mark comment resolved" })
+  cmd("CritUnresolve", function() M.unresolve_at_cursor() end,
+    { desc = "crit-vim: mark comment unresolved" })
+  cmd("CritToggleResolved", function() M.toggle_show_resolved() end,
+    { desc = "crit-vim: show or hide resolved comments" })
+  cmd("CritVersion", function() M.version() end,
+    { desc = "crit-vim: show plugin + CLI + session versions" })
+
+  -- <Plug> API. See README.
+  function _G.crit_vim_op(_motion_type)
+    local s = vim.api.nvim_buf_get_mark(0, "[")
+    local e = vim.api.nvim_buf_get_mark(0, "]")
+    M.comment_range(s, e)
+  end
+
+  vim.keymap.set("n", "<Plug>(CritComment)", function()
+    vim.o.operatorfunc = "v:lua.crit_vim_op"
+    return "g@"
+  end, { expr = true, desc = "crit-vim: comment on motion" })
+
+  vim.keymap.set("x", "<Plug>(CritComment)", function()
+    vim.o.operatorfunc = "v:lua.crit_vim_op"
+    return "g@"
+  end, { expr = true, desc = "crit-vim: comment on selection" })
+
+  vim.keymap.set("n", "<Plug>(CritCommentLine)", function()
+    M.comment_line(vim.api.nvim_win_get_cursor(0)[1])
+  end, { desc = "crit-vim: comment on current line" })
+
+  vim.keymap.set("n", "<Plug>(CritReply)", function() M.reply_at_cursor() end,
+    { desc = "crit-vim: reply to comment under cursor" })
+
+  vim.keymap.set("n", "<Plug>(CritResolve)", function() M.toggle_resolved_at_cursor() end,
+    { desc = "crit-vim: toggle resolved on comment under cursor" })
+end
+
 -- Optional convenience for users who don't want to write their own `keys`
 -- block. Call with `{ default_keys = true }` to bind <leader>C{,C} to the
 -- <Plug> targets globally.
