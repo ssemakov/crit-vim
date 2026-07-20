@@ -50,6 +50,25 @@ session_file_path() {
   printf '%s\n' "$HOME/.crit/sessions/$key.json"
 }
 
+# Ask crit where its session lives instead of recomputing the key. crit's own
+# key derivation is internal and has drifted across versions (mirroring it as
+# sha256(cwd\0branch) broke on crit 0.18 — it matches some repos, not others).
+# `crit status --json` reports review_file = <reviews>/<session-id>/review.json,
+# and the daemon writes sessions/<session-id>.json — same id. Works with or
+# without a running daemon. Echoes the session-file path, or returns 1.
+crit_session_file() {
+  local repo="$1" id
+  id=$( cd "$repo" && crit status --json 2>/dev/null | python3 -c '
+import json, os, sys
+try:
+    rf = (json.load(sys.stdin).get("review_file") or "")
+except Exception:
+    sys.exit(1)
+print(os.path.basename(os.path.dirname(rf)) if rf else "")' ) || return 1
+  [[ -n "$id" ]] || return 1
+  printf '%s\n' "$HOME/.crit/sessions/$id.json"
+}
+
 socket_registry_path() {
   local repo="$1"
   local sha
@@ -57,28 +76,54 @@ socket_registry_path() {
   printf '%s' "$HOME/.crit-vim/sockets/$sha"
 }
 
+# Evaluate a --remote-expr against an nvim server, UI-free. In an interactive
+# terminal a bare `nvim --server … --remote-expr` starts a full TUI: it writes
+# escape codes to stdout and the actual result to stderr, so a caller capturing
+# stdout gets garbage instead of the value. --headless disables the UI and
+# </dev/null keeps nvim from ever thinking it owns the terminal.
+nvim_expr() {
+  nvim --headless --server "$1" --remote-expr "$2" </dev/null 2>/dev/null
+}
+
+# True if the nvim at $1 is reachable AND has crit-vim's start_review_v2 loaded.
+socket_has_v2() {
+  local r
+  r=$(nvim_expr "$1" \
+        "luaeval('(type(require\"crit-vim\".start_review_v2) == \"function\") and 1 or 0')" \
+        || echo 0)
+  [[ "$r" == "1" ]]
+}
+
 find_socket() {
-  # Resolution order: --socket > $CRIT_VIM_SOCKET > $NVIM > per-repo registry.
+  # --socket is an explicit override: trust it verbatim.
   if [[ -n "${FORCE_SOCKET:-}" ]]; then printf '%s\n' "$FORCE_SOCKET"; return 0; fi
-  if [[ -n "${CRIT_VIM_SOCKET:-}" ]]; then printf '%s\n' "$CRIT_VIM_SOCKET"; return 0; fi
-  if [[ -n "${NVIM:-}" ]]; then printf '%s\n' "$NVIM"; return 0; fi
-  local repo
-  repo=$(repo_root) || return 1
-  local reg
-  reg=$(socket_registry_path "$repo")
-  if [[ -f "$reg" ]]; then
-    local s
-    s=$(cat "$reg")
-    if [[ -n "$s" ]]; then
-      printf '%s\n' "$s"
-      return 0
-    fi
+
+  # Candidates in precedence order: $CRIT_VIM_SOCKET > $NVIM > per-repo registry.
+  # A stale $NVIM (e.g. a leftover :terminal whose parent nvim was replaced) is
+  # reachable but has no plugin — it must not shadow a live nvim that does. So
+  # prefer the first candidate exposing start_review_v2; only if none do, fall
+  # back to the first merely-reachable one (so the caller's guard can print its
+  # actionable "reload the plugin" message).
+  local candidates=() repo reg s
+  [[ -n "${CRIT_VIM_SOCKET:-}" ]] && candidates+=("$CRIT_VIM_SOCKET")
+  [[ -n "${NVIM:-}" ]] && candidates+=("$NVIM")
+  if repo=$(repo_root); then
+    reg=$(socket_registry_path "$repo")
+    [[ -f "$reg" ]] && { s=$(cat "$reg"); [[ -n "$s" ]] && candidates+=("$s"); }
   fi
+
+  local first_reachable="" c
+  for c in ${candidates[@]+"${candidates[@]}"}; do
+    nvim_reachable "$c" || continue
+    [[ -z "$first_reachable" ]] && first_reachable="$c"
+    if socket_has_v2 "$c"; then printf '%s\n' "$c"; return 0; fi
+  done
+  [[ -n "$first_reachable" ]] && { printf '%s\n' "$first_reachable"; return 0; }
   return 1
 }
 
 nvim_reachable() {
-  nvim --server "$1" --remote-expr '1' >/dev/null 2>&1
+  nvim --headless --server "$1" --remote-expr '1' </dev/null >/dev/null 2>&1
 }
 
 # ---------- review ----------
@@ -147,10 +192,12 @@ EOM
     die "nvim socket is unreachable: $sock"
   fi
 
-  # Compute the session key and see whether a daemon is already running.
-  local key session_file
-  key=$(session_key_for_cwd_branch "$repo" "$branch")
-  session_file=$(session_file_path "$key")
+  # Ask crit for its session file; fall back to the legacy mirrored key only if
+  # `crit status` is unavailable. See whether a daemon is already running.
+  local session_file key
+  session_file=$(crit_session_file "$repo") \
+    || session_file=$(session_file_path "$(session_key_for_cwd_branch "$repo" "$branch")")
+  key=$(basename "$session_file" .json)   # crit's real session id (for nvim's session_key)
 
   local spawn=1
   if [[ -f "$session_file" ]]; then
@@ -248,9 +295,9 @@ print(json.dumps({
   # a previous branch — tell them how to fix it instead of dumping a
   # `nil value` traceback.
   local has_v2
-  has_v2=$(nvim --server "$sock" --remote-expr \
+  has_v2=$(nvim_expr "$sock" \
     "luaeval('(type(require\"crit-vim\".start_review_v2) == \"function\") and 1 or 0')" \
-    2>/dev/null || echo 0)
+    || echo 0)
   if [[ "$has_v2" != "1" ]]; then
     cat >&2 <<'EOM'
 crit-vim: the running nvim has an older crit-vim plugin loaded.
@@ -264,9 +311,9 @@ EOM
     exit 2
   fi
 
-  if ! nvim --server "$sock" --remote-expr \
+  if ! nvim --headless --server "$sock" --remote-expr \
         "luaeval('require\"crit-vim\".start_review_v2(vim.json.decode(vim.base64.decode(_A)))', '$args_b64')" \
-        >/dev/null 2>/tmp/crit-vim.nvim.err; then
+        </dev/null >/dev/null 2>/tmp/crit-vim.nvim.err; then
     echo "crit-vim: failed to start review in nvim" >&2
     cat /tmp/crit-vim.nvim.err >&2 || true
     exit 2
@@ -346,12 +393,11 @@ cmd_doctor() {
   local repo
   if repo=$(repo_root); then
     echo "  repo=$repo"
-    local branch key sf
+    local branch sf
     branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
-    key=$(session_key_for_cwd_branch "$repo" "$branch")
-    sf=$(session_file_path "$key")
+    sf=$(crit_session_file "$repo") \
+      || sf=$(session_file_path "$(session_key_for_cwd_branch "$repo" "$branch")")
     echo "  branch=$branch"
-    echo "  session_key=$key"
     if [[ -f "$sf" ]]; then
       echo "  session_file=$sf (exists)"
     else
@@ -380,9 +426,9 @@ cmd_doctor() {
     if nvim_reachable "$resolved"; then
       echo "    reachable: yes"
       local has_v2
-      has_v2=$(nvim --server "$resolved" --remote-expr \
+      has_v2=$(nvim_expr "$resolved" \
         "luaeval('(type(require\"crit-vim\".start_review_v2) == \"function\") and 1 or 0')" \
-        2>/dev/null || echo 0)
+        || echo 0)
       if [[ "$has_v2" == "1" ]]; then
         echo "    plugin: 0.2.0+ (has start_review_v2)"
       else
