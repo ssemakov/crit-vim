@@ -1,13 +1,22 @@
 ---
 name: crit-vim
 description: Review code changes inside the user's running Neovim using crit-vim (attaches to a crit daemon; supports threaded replies + resolve). Use when the user asks to review your changes "in vim", "with crit-vim", or whenever you want structured inline feedback via the vim review surface.
-allowed-tools: Bash(crit-vim:*), Bash(crit:*), Read, Edit, MultiEdit, Grep, Glob
+allowed-tools: Bash(crit-vim:*), Bash(crit:*), Bash(curl:*), Read, Edit, MultiEdit, Grep, Glob
 argument-hint: "[--base REF]"
 ---
 
 # Review with crit-vim
 
-Review and revise code changes using `crit-vim` — an nvim-native client for [tomasz-tomczyk/crit](https://github.com/tomasz-tomczyk/crit). The user authors comments (and reply threads) in Neovim; you read the resulting JSON and address each comment by editing files.
+Review and revise code changes using `crit-vim` — an nvim-native client for [tomasz-tomczyk/crit](https://github.com/tomasz-tomczyk/crit). The user authors comments (and reply threads) in Neovim; you read them, address them, and reply — all through crit's daemon.
+
+## Ground rule
+
+**Never edit `~/.crit/reviews/*/review.json` directly.** The daemon owns that file with atomic writes and SSE notifications; hand-editing it races the daemon, breaks the browser + nvim views, and skips ID generation. Always mutate through:
+
+- The `crit` CLI (`crit comment ...`) — the ergonomic path; covers 90 % of cases.
+- The daemon HTTP API (`http://127.0.0.1:<port>/api/*`) — for update / delete / standalone resolve.
+
+`crit comments --json` is the canonical way to READ the review state.
 
 ## Prerequisites
 
@@ -62,20 +71,15 @@ Top-level shape (crit v4 review file):
       "comments": [
         {
           "id": "c_1df20f",
-          "start_line": 42,
-          "end_line": 42,
-          "side": "",
-          "scope": "line",
+          "start_line": 42, "end_line": 42,
+          "side": "",  "scope": "line",
           "body": "this should handle EOF",
-          "quote": "for {",
-          "anchor": "for {",
-          "resolved": false,
-          "resolved_round": 0,
+          "quote": "for {",  "anchor": "for {",
+          "resolved": false,  "resolved_round": 0,
           "replies": [
             {"id": "rp_ab12", "body": "acknowledged, will fix", "author": "you", "created_at": "..."}
           ],
-          "created_at": "...",
-          "updated_at": "..."
+          "created_at": "...", "updated_at": "..."
         }
       ]
     }
@@ -85,12 +89,11 @@ Top-level shape (crit v4 review file):
 ```
 
 Rules:
-- `resolved: true` → the comment thread is closed. Skip it unless the user asks otherwise.
-- `resolved: false` → actionable. Read the whole thread: `body` + every `replies[].body`. The latest reply often narrows or clarifies the ask.
+- `resolved: true` → the thread is closed. Skip unless the user asks otherwise.
+- `resolved: false` → actionable. Read the whole thread — parent `body` PLUS every `replies[].body`. Latest reply usually clarifies the ask.
 - `side: ""` (or `"right"`) → comment is on your proposed code.
-- `side: "old"` (or `"left"`) → comment is on the base version — usually a question about why you removed something.
-- `quote`: the verbatim text the user selected. Focus your change there.
-- `anchor`: (v4 crit) short snippet used for drift detection.
+- `side: "old"` (or `"left"`) → comment is on the base — usually a question about a removal.
+- `quote`: verbatim text the user selected — focus edits there.
 
 ## Step 3: Address each comment
 
@@ -98,40 +101,90 @@ For each unresolved comment:
 
 1. Read the comment + all replies.
 2. Edit the referenced file with `Edit` / `MultiEdit`.
-3. **Optionally post a reply** so the user knows what you did:
+3. **Post a reply** so the user knows what you did (recommended):
 
     ```bash
     crit comment --reply-to <comment_id> --author 'Claude' 'Extracted into helper; see line 88.'
     ```
 
-    Add `--resolve` to also mark the thread resolved in one call:
+    Add `--resolve` to also close the thread in one call:
 
     ```bash
     crit comment --reply-to <comment_id> --resolve --author 'Claude' 'Fixed in this round.'
     ```
 
-If there are zero unresolved comments, the user has approved. Stop and inform them.
+If there are zero unresolved comments left, the user has approved. Stop and inform them.
 
 ## Step 4: Next round
 
-After addressing comments, run `crit-vim review` **in the background** again:
+After addressing comments, run `crit-vim review` in the background again. Same repo+branch → same session key → the previous round's comments (and your replies) stay visible alongside the fresh diff.
 
 ```bash
 crit-vim review
 ```
 
-The plugin re-attaches to the same crit session (same key = cwd + branch), so the user sees your updated diff **with the previous round's comments and your replies still in place**. Tell the user:
+Tell the user:
 
 > **"Changes applied. `:CritFinish` when ready, or `:CritCancel` if everything looks good."**
 
 Loop back to Step 2.
+
+## API cheat-sheet
+
+The `crit comment` CLI covers add + reply (+ optional resolve on the reply). For anything else — updating a body, deleting, standalone resolve/unresolve — hit the daemon HTTP API. The port comes from `crit status --json`:
+
+```bash
+port=$(crit status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["daemon"]["port"])')
+```
+
+Then:
+
+```bash
+# Update the body of a comment
+curl -sS -X PUT -H 'Content-Type: application/json' \
+  -d '{"body":"new body"}' \
+  "http://127.0.0.1:$port/api/comment/<id>?path=<file>"
+
+# Delete a comment
+curl -sS -X DELETE "http://127.0.0.1:$port/api/comment/<id>?path=<file>"
+
+# Resolve (without replying)
+curl -sS -X PUT -H 'Content-Type: application/json' \
+  -d '{"resolved":true}' \
+  "http://127.0.0.1:$port/api/comment/<id>/resolve?path=<file>"
+
+# Unresolve (re-open a thread)
+curl -sS -X PUT -H 'Content-Type: application/json' \
+  -d '{"resolved":false}' \
+  "http://127.0.0.1:$port/api/comment/<id>/resolve?path=<file>"
+
+# Edit or delete an existing reply
+curl -sS -X PUT -H 'Content-Type: application/json' \
+  -d '{"body":"updated reply"}' \
+  "http://127.0.0.1:$port/api/comment/<comment_id>/replies/<reply_id>?path=<file>"
+curl -sS -X DELETE \
+  "http://127.0.0.1:$port/api/comment/<comment_id>/replies/<reply_id>?path=<file>"
+
+# Add a line comment (equivalent to `crit comment <file>:<line> <body>`)
+curl -sS -X POST -H 'Content-Type: application/json' \
+  -d '{"start_line":42,"end_line":42,"body":"...","author":"Claude","scope":"line"}' \
+  "http://127.0.0.1:$port/api/file/comments?path=<file>"
+
+# Add a review-level comment (no file, no line — top-level thread)
+curl -sS -X POST -H 'Content-Type: application/json' \
+  -d '{"body":"overall this looks good","author":"Claude"}' \
+  "http://127.0.0.1:$port/api/comments"
+```
+
+All mutations broadcast SSE `comments-changed`, so nvim and any open browser tab refresh live.
 
 ## Notes
 
 - **Never modify files while the review is open** — the working tree is what the user is reviewing (the plugin diffs against `base_ref`, but the right side is the live file).
 - **`--base`** defaults to auto-detection (crit chooses based on VCS state). Pass `--base REF` to override.
 - **Files not yet committed**: tracked modifications + untracked-but-present files (treated as added) both show up. The user does not need to `git add`.
-- **Comments authored via `crit comment`** appear in nvim live via SSE — no need to restart the review.
+- **Comments authored via `crit comment` or the API appear in nvim live** via SSE — no need to restart the review.
+- **URL-encode the `path` query parameter** if it contains characters other than `[A-Za-z0-9_.~/-]`.
 
 ---
 
@@ -145,28 +198,31 @@ crit-vim status                                # proxy to `crit status --json`
 crit-vim doctor
 ```
 
-Companion `crit comment` (from tomasz-tomczyk/crit, headless):
+`crit` companion (headless, no daemon required for `comment --clear` / `comment --reply-to`):
 
 ```bash
-crit comment <file>:<line>[-end] '<body>'      # add a line comment
-crit comment --reply-to <id> '<body>'          # reply
+crit comment <file>:<line>[-end] '<body>'       # add a line comment
+crit comment --reply-to <id> '<body>'           # reply
 crit comment --reply-to <id> --resolve '<body>' # reply + resolve
-crit comments --json                            # list all
+crit comment --clear                            # remove ALL comments
+crit comments [--json]                          # list
+crit status  [--json]                           # daemon + review file paths
+crit stop                                       # kill the daemon
 ```
 
 ### Comment shape
 
-| Field | Notes |
-|---|---|
-| `id` | e.g. `c_1df20f`. Stable across rounds. |
-| `start_line` / `end_line` | 1-based. |
-| `side` | `""` (right / new) or `"old"` (left / base). |
-| `scope` | `"line"`, `"file"`, or `"review"`. |
-| `body` | Markdown allowed. |
-| `resolved` / `resolved_round` | Skip if `resolved:true`. |
-| `replies` | Array of `{id, body, author, created_at}`. |
-| `quote` | Verbatim selected text — focus here. |
-| `anchor` | Short snippet for drift detection. |
+| Field                         | Notes                                             |
+| ----------------------------- | ------------------------------------------------- |
+| `id`                          | e.g. `c_1df20f`. Stable across rounds.            |
+| `start_line` / `end_line`     | 1-based.                                          |
+| `side`                        | `""` (right / new) or `"old"` (left / base).      |
+| `scope`                       | `"line"`, `"file"`, or `"review"`.                |
+| `body`                        | Markdown allowed.                                 |
+| `resolved` / `resolved_round` | Skip if `resolved:true`.                          |
+| `replies`                     | Array of `{id, body, author, created_at}`.       |
+| `quote`                       | Verbatim selected text — focus edits here.        |
+| `anchor`                      | Short snippet for drift detection.                |
 
 ### Socket discovery
 
