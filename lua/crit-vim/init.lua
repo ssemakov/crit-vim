@@ -49,6 +49,33 @@ vim.api.nvim_create_autocmd("ColorScheme", {
   callback = ensure_highlights,
 })
 
+-- ---------- logging ----------
+--
+-- Always appends to ~/.crit-vim/debug.log so a user hitting a bug on another
+-- machine can share the file with a maintainer. Also emits vim.notify by
+-- default (silenced when opts.silent).
+
+local function log_path() return vim.fn.expand("~/.crit-vim/debug.log") end
+
+local function log(msg, level, opts)
+  level = level or vim.log.levels.INFO
+  opts = opts or {}
+  if not opts.silent then
+    pcall(vim.notify, msg, level)
+  end
+  pcall(function()
+    vim.fn.mkdir(vim.fn.expand("~/.crit-vim"), "p")
+    local f = io.open(log_path(), "a")
+    if f then
+      local lvl = ({ [0] = "TRACE", [1] = "DEBUG", [2] = "INFO",
+                     [3] = "WARN", [4] = "ERROR", [5] = "OFF" })[level] or "?"
+      f:write(string.format("[%s] %-5s %s\n",
+        os.date("!%Y-%m-%dT%H:%M:%SZ"), lvl, msg))
+      f:close()
+    end
+  end)
+end
+
 -- ---------- filesystem / json helpers ----------
 
 local function read_file(path)
@@ -210,6 +237,36 @@ local function git_show(repo, ref, path)
   return lines
 end
 
+-- Detect binary content by reading the first ~8KB of `path` in `ref` (or the
+-- working tree if `ref == nil`) and scanning for a NUL byte. `git diff` uses
+-- the same heuristic. Returns true for binary files (images, PDFs, etc.).
+local function is_binary_file(repo, ref, path)
+  local abs = repo .. "/" .. path
+  local data
+  if ref then
+    -- `git show` writes raw bytes to stdout; systemlist splits on newline and
+    -- would drop NULs, so use system() and read as string.
+    data = vim.fn.system({ "git", "-C", repo, "show", ref .. ":" .. path })
+    if vim.v.shell_error ~= 0 then data = nil end
+  else
+    local f = io.open(abs, "rb")
+    if f then data = f:read(8192); f:close() end
+  end
+  if not data or data == "" then return false end
+  return data:sub(1, 8192):find("\0", 1, true) ~= nil
+end
+
+-- nvim_buf_set_name errors with E95 if another buffer already claims the
+-- name (typical when a prior review left scratch buffers around). Wipe the
+-- collider first, then set.
+local function safe_set_buf_name(buf, name)
+  local existing = vim.fn.bufnr(name)
+  if existing > 0 and existing ~= buf and vim.api.nvim_buf_is_valid(existing) then
+    pcall(vim.api.nvim_buf_delete, existing, { force = true })
+  end
+  vim.api.nvim_buf_set_name(buf, name)
+end
+
 -- Mark a real-file buffer as part of the review (so :CritComment etc. can
 -- find it) without making it read-only — the user may want to edit.
 local function mark_real_review_buffer(buf, file, side)
@@ -239,7 +296,7 @@ local function open_file_diff(file_info, base, repo)
   if file_info.status == "deleted" then
     vim.cmd("tabnew")
     local buf = vim.api.nvim_get_current_buf()
-    vim.api.nvim_buf_set_name(buf, file_info.path .. " [deleted]")
+    safe_set_buf_name(buf, file_info.path .. " [deleted]")
     fill_buffer(buf, git_show(repo, base, file_info.old_path or file_info.path))
     set_review_buffer(buf, file_info.path, "left", file_info.path)
     set_diff_window_options(0)
@@ -258,7 +315,7 @@ local function open_file_diff(file_info, base, repo)
 
   vim.cmd("leftabove vsplit | enew")
   local left_buf = vim.api.nvim_get_current_buf()
-  vim.api.nvim_buf_set_name(left_buf, file_info.path .. " [" .. base .. "]")
+  safe_set_buf_name(left_buf, file_info.path .. " [" .. base .. "]")
   fill_buffer(left_buf, git_show(repo, base, file_info.old_path or file_info.path))
   set_review_buffer(left_buf, file_info.path, "left", file_info.path)
   vim.cmd("diffthis")
@@ -469,8 +526,14 @@ end
 -- Entry point for the new CLI: attach to a running crit daemon.
 -- args = { port, host, review_path, session_key }
 function M.start_review_v2(args)
+  log(string.format("start_review_v2 port=%d host=%s key=%s review_path=%s",
+    tonumber(args.port or 0) or 0,
+    tostring(args.host or "?"),
+    tostring(args.session_key or "?"),
+    tostring(args.review_path or "?")), vim.log.levels.INFO, { silent = true })
   if M.session then
     vim.notify("crit-vim: replacing stale review with new attach", vim.log.levels.WARN)
+    log("replacing stale session", vim.log.levels.WARN, { silent = true })
     close_session("replaced")
   end
 
@@ -518,11 +581,52 @@ function M.start_review_v2(args)
       vim.notify("crit-vim: no changed files in this session", vim.log.levels.WARN)
     end
 
+    -- Filter out binary files up front — we can't render meaningful diffs
+    -- for them and `git show` fills scratch buffers with garbage. For added
+    -- files the source of truth is the working tree; otherwise the base ref.
+    local text_files = {}
+    local skipped_binary = 0
+    for _, fi in ipairs(M.session.files) do
+      local binary
+      if fi.status == "added" then
+        binary = is_binary_file(M.session.repo, nil, fi.path)
+      else
+        binary = is_binary_file(M.session.repo, M.session.base,
+          fi.old_path or fi.path)
+      end
+      if binary then
+        skipped_binary = skipped_binary + 1
+        log("skipping binary file: " .. fi.path,
+          vim.log.levels.DEBUG, { silent = true })
+      else
+        table.insert(text_files, fi)
+      end
+    end
+    M.session.files = text_files
+    if skipped_binary > 0 then
+      log(string.format("crit-vim: skipped %d binary file(s)", skipped_binary),
+        vim.log.levels.INFO)
+    end
+
+    local total = #M.session.files
     for i, file_info in ipairs(M.session.files) do
-      local bufs = open_file_diff(file_info, M.session.base, M.session.repo)
-      M.session.file_bufs[file_info.path] = bufs
-      if i == 1 then M.session.first_tab = bufs.tab end
-      open_sidebar_in_current_tab()
+      -- Progress ping every 5 files (or on last) so large reviews don't
+      -- look stalled. Silent in the log; visible via vim.notify.
+      if total > 10 and (i == 1 or i % 5 == 0 or i == total) then
+        log(string.format("crit-vim: loading %d/%d (%s)",
+          i, total, file_info.path), vim.log.levels.INFO)
+        vim.cmd("redraw")
+      end
+      local ok_open, err_or_bufs = pcall(open_file_diff, file_info,
+        M.session.base, M.session.repo)
+      if not ok_open then
+        log(string.format("crit-vim: failed to open %s: %s",
+          file_info.path, tostring(err_or_bufs)), vim.log.levels.WARN)
+      else
+        M.session.file_bufs[file_info.path] = err_or_bufs
+        if not M.session.first_tab then M.session.first_tab = err_or_bufs.tab end
+        open_sidebar_in_current_tab()
+      end
     end
 
     if M.session.first_tab then
@@ -1295,11 +1399,24 @@ function M.reopen()
   -- may hold the user's unsaved edits — we don't want to lose those).
   teardown_session_ui()
   M.session.file_bufs = {}
+  M.session.first_tab = nil
+  local total = #M.session.files
   for i, file_info in ipairs(M.session.files) do
-    local bufs = open_file_diff(file_info, M.session.base, M.session.repo)
-    M.session.file_bufs[file_info.path] = bufs
-    if i == 1 then M.session.first_tab = bufs.tab end
-    open_sidebar_in_current_tab()
+    if total > 10 and (i == 1 or i % 5 == 0 or i == total) then
+      log(string.format("crit-vim: reopening %d/%d (%s)",
+        i, total, file_info.path), vim.log.levels.INFO)
+      vim.cmd("redraw")
+    end
+    local ok_open, bufs = pcall(open_file_diff, file_info,
+      M.session.base, M.session.repo)
+    if not ok_open then
+      log(string.format("crit-vim: failed to reopen %s: %s",
+        file_info.path, tostring(bufs)), vim.log.levels.WARN)
+    else
+      M.session.file_bufs[file_info.path] = bufs
+      if not M.session.first_tab then M.session.first_tab = bufs.tab end
+      open_sidebar_in_current_tab()
+    end
   end
   if M.session.first_tab then
     pcall(vim.api.nvim_set_current_tabpage, M.session.first_tab)
@@ -1547,6 +1664,22 @@ local function plugin_version()
   return v ~= "" and v or "(unknown)"
 end
 
+-- Open the crit-vim debug log in a scratch buffer for inspection. Handy for
+-- debugging remote-machine issues: users can `:CritLog` and paste the tail.
+function M.show_log()
+  local path = log_path()
+  if vim.fn.filereadable(path) == 0 then
+    vim.notify("crit-vim: no log yet at " .. path, vim.log.levels.INFO)
+    return
+  end
+  vim.cmd("tabnew " .. vim.fn.fnameescape(path))
+  vim.bo.buftype = ""
+  vim.notify("crit-vim: log at " .. path, vim.log.levels.INFO)
+end
+
+-- Print the log file path (for scripts / `:!cat $(...)` piping).
+function M.log_path() return log_path() end
+
 -- Print crit-vim plugin version + crit CLI version + (if a review is active)
 -- session summary + daemon health.
 function M.version()
@@ -1650,6 +1783,8 @@ function M._register()
     { desc = "crit-vim: show or hide resolved comments" })
   cmd("CritVersion", function() M.version() end,
     { desc = "crit-vim: show plugin + CLI + session versions" })
+  cmd("CritLog", function() M.show_log() end,
+    { desc = "crit-vim: open the debug log file in a tab" })
 
   -- <Plug> API. See README.
   function _G.crit_vim_op(_motion_type)
