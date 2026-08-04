@@ -389,7 +389,7 @@ local function ensure_sidebar_buf()
   if existing and vim.api.nvim_buf_is_valid(existing) then return existing end
 
   local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_name(buf, "critvim://sidebar")
+  safe_set_buf_name(buf, "critvim://sidebar")
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].swapfile = false
@@ -978,10 +978,8 @@ local function open_comment_buffer(ctx)
   -- Plain text — no embedded-language detection (markdown was lighting up
   -- as HTML for some users).
   vim.bo[buf].filetype = "text"
-  vim.api.nvim_buf_set_name(
-    buf,
-    string.format("critvim://%s/%d-%d", ctx.file, ctx.start_line, ctx.end_line)
-  )
+  safe_set_buf_name(buf,
+    string.format("critvim://%s/%d-%d", ctx.file, ctx.start_line, ctx.end_line))
 
   local width = math.min(80, math.max(40, math.floor(vim.o.columns * 0.6)))
   local height = math.max(6, math.floor(vim.o.lines * 0.25))
