@@ -87,12 +87,26 @@ You need two things:
 2. **A shell** where you (or the agent) can run `crit-vim review`.
 
 ```sh
-crit-vim review
+crit-vim review                      # crit's default (usually branch vs main)
+crit-vim review --base HEAD          # only my uncommitted work (== --scope unstaged)
+crit-vim review --scope unstaged     # working tree only
+crit-vim review --scope branch       # branch commits only
+crit-vim review --scope all          # branch commits + working tree
 ```
 
-That spawns a crit daemon (if none is running for this cwd+branch), waits
-for it to become ready, tells nvim to attach, and blocks until you finish
-the review (either from nvim via `:CritFinish` or from a browser tab).
+`crit-vim review` spawns a crit daemon (if none is running for this
+cwd+branch), waits for it to become ready, tells nvim to attach, and
+blocks until you finish the review (either from nvim via `:CritFinish` or
+from a browser tab).
+
+On attach the plugin prints the effective scope so you're not surprised:
+
+```
+crit-vim: 1 file(s) · round 1 · scope=unstaged (vs main) — :CritFinish to submit
+```
+
+Binary files are skipped automatically (detected via a NUL byte in the
+first 8KB of `git show`).
 
 In nvim, one diff tab opens per changed file, with a sidebar on the left
 listing files and comment counts. `<CR>` on a sidebar row jumps to that
@@ -122,8 +136,12 @@ Inside the floating buffer:
 | Command / Keymap        | Behaviour                                                        |
 | ----------------------- | ---------------------------------------------------------------- |
 | `:CritReply`            | Reply to the comment under the cursor (opens the comment buffer) |
-| `:CritResolve`          | Toggle resolved state on the comment under the cursor            |
+| `:CritEditReply`        | Pick a reply of the comment under cursor and edit it             |
+| `:CritDeleteReply`      | Pick a reply and delete it (prompts y/N)                         |
+| `:CritResolve`          | Mark the comment under the cursor as resolved                    |
+| `:CritUnresolve`        | Mark the comment under the cursor as unresolved                  |
 | `:CritToggleResolved`   | Show or hide resolved comments in this session                   |
+| `<Plug>(CritResolve)`   | Toggle resolved (compact one-key binding)                        |
 
 Reply threads render inside the same bordered card as the parent comment,
 separated by a horizontal divider and prefixed with `↳ @author`. Resolved
@@ -139,6 +157,7 @@ comments render dimmed with a strikethrough body (or hide entirely when
 | `:CritList`    | quickfix list of all comments                      |
 | `:CritSidebar` | toggle the file list sidebar in this tab           |
 | `:CritReopen`  | rebuild diff tabs + sidebars (after `<C-w>o` etc.) |
+| `:CritScope [name]` | switch scope on the fly (unstaged/staged/branch/all); no arg = show current |
 
 ### Editing during review
 
@@ -148,10 +167,24 @@ review surface) sees the change on next round.
 
 ### Submitting the review
 
-| Command       | Behaviour                                                                 |
-| ------------- | ------------------------------------------------------------------------- |
-| `:CritFinish` | POST `/api/finish`, stop the daemon; the blocked `crit-vim review` exits. |
-| `:CritCancel` | Stop the daemon without finishing.                                        |
+| Command       | Behaviour                                                                                    |
+| ------------- | -------------------------------------------------------------------------------------------- |
+| `:CritFinish` | POST `/api/finish`, stop the daemon; the CLI prints comments as JSON to stdout, exits 0.     |
+| `:CritCancel` | Stop the daemon and withhold comments from the agent; CLI exits 1 without printing anything. |
+
+`:CritCancel` writes a sentinel at `~/.crit-vim/last-cancel` before killing
+the daemon; the CLI checks it before printing comments so cancelled reviews
+never reach the agent. Comments remain in the review file for the next
+`crit-vim review` in the same repo+branch.
+
+### Debugging
+
+| Command / File             | What it gives you                                     |
+| -------------------------- | ----------------------------------------------------- |
+| `:CritVersion`             | plugin + `crit` CLI + session summary + daemon health |
+| `:CritLog`                 | open `~/.crit-vim/debug.log` (append-only) in a tab   |
+| `crit-vim doctor`          | nvim socket + crit binary + plugin freshness         |
+| `~/.crit-vim/debug.log`    | timestamped log of attach + errors; shareable        |
 
 ## Cross-surface parity
 
@@ -165,14 +198,22 @@ Because the daemon is authoritative and both surfaces subscribe to
 
 ## CLI commands
 
-| Command                        | What it does                                            |
-| ------------------------------ | ------------------------------------------------------- |
-| `crit-vim review [--base REF]` | ensure crit daemon, attach nvim, block on `:CritFinish` |
-| `crit-vim status`              | proxy to `crit status --json`                           |
-| `crit-vim doctor`              | diagnose nvim socket + crit binary + session file       |
+| Command                                    | What it does                                            |
+| ------------------------------------------ | ------------------------------------------------------- |
+| `crit-vim review [--base REF] [--scope N]` | ensure crit daemon, attach nvim, block on `:CritFinish` |
+| `crit-vim status`                          | proxy to `crit status --json`                           |
+| `crit-vim doctor`                          | diagnose nvim socket + crit binary + plugin freshness   |
 
-`crit-vim review` accepts `--open-browser` to also open a browser tab
-alongside nvim (default: nvim only).
+`crit-vim review` flags:
+- `--base HEAD` — shortcut for `--scope unstaged`.
+- `--base <ref>` — pass `--range <ref>..HEAD` to `crit`.
+- `--scope <name>` — narrow to a subset of the branch diff (`unstaged`,
+  `staged`, `branch`, `all`). Applied via `GET /api/session?scope=...`
+  after the daemon comes up; the plugin diffs against `HEAD` for
+  unstaged/staged so the left side reflects the immediately-preceding
+  state.
+- `--open-browser` — also open a browser tab alongside nvim (default:
+  nvim only).
 
 ## `<Plug>` API
 

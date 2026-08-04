@@ -29,10 +29,14 @@ If no reachable nvim, ask the user to open one in the repo. **Don't start nvim y
 ## Step 1: Launch and block
 
 ```bash
-crit-vim review
+crit-vim review                    # crit default (usually branch vs main)
+crit-vim review --base HEAD        # user's uncommitted work (== --scope unstaged)
+crit-vim review --scope unstaged   # narrow explicitly
 ```
 
 Foreground blocking is fine (Codex has no explicit background/foreground). Set a long timeout — reviews take minutes.
+
+`--scope` values: `unstaged` | `staged` | `branch` | `all`. Without one, crit auto-detects and often shows the whole branch — pass `--base HEAD` when the user only cares about their WIP.
 
 Tell the user:
 
@@ -40,7 +44,7 @@ Tell the user:
 
 Exit codes:
 - `0` → finished; JSON on stdout.
-- `1` → cancelled or `crit` missing.
+- `1` → cancelled (`:CritCancel`) or `crit` missing. **No comments are printed.** Do NOT read the review file to salvage comments — cancel means the user rejected this round.
 - `2` → setup error. Read stderr.
 - `124` → timeout.
 
@@ -138,9 +142,9 @@ All mutations broadcast SSE `comments-changed` — nvim + browser re-render live
 ## Reference
 
 ```bash
-crit-vim review [--base REF] [--timeout SECS] [--socket PATH] [--open-browser]
+crit-vim review [--base REF] [--scope NAME] [--timeout SECS] [--socket PATH] [--open-browser]
 crit-vim status                                # proxy to `crit status --json`
-crit-vim doctor
+crit-vim doctor                                # includes plugin freshness check
 
 crit comment <file>:<line>[-end] '<body>'
 crit comment --reply-to <id> '<body>'

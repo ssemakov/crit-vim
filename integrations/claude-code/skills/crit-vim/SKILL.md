@@ -43,6 +43,10 @@ crit-vim review
 - tells nvim to attach to it, and
 - blocks until the user runs `:CritFinish` or `:CritCancel` in nvim (or hits Approve in a browser tab, if they opened one).
 
+Useful flags:
+- `--base HEAD` — narrow to the user's uncommitted work (implies `--scope unstaged`).
+- `--scope unstaged|staged|branch|all` — narrow explicitly; `unstaged` is usually what "just my current work" means on a feature branch. Without a scope, crit defaults to the whole branch vs its base branch, which on long-lived branches surfaces every committed change.
+
 Tell the user verbatim:
 
 > **"Review is open in your nvim. Drop comments on the diff, then `:CritFinish` when done."**
@@ -50,7 +54,7 @@ Tell the user verbatim:
 **Do NOT proceed until the background task completes.** When the task completes, the exit code tells you what happened:
 
 - `0` → user finished the review. JSON is on stdout (via `crit comments --json`).
-- `1` → user cancelled, or the crit binary is missing.
+- `1` → user cancelled (`:CritCancel`), or the crit binary is missing. **No comments are printed.** Do NOT infer intent from any comments already in the review file — the user explicitly rejected this round.
 - `2` → setup error (no reachable nvim, daemon didn't come up). Read stderr and relay to the user.
 - `124` → `--timeout` elapsed. Treat as cancel.
 
@@ -193,10 +197,14 @@ All mutations broadcast SSE `comments-changed`, so nvim and any open browser tab
 ### CLI subcommands
 
 ```bash
-crit-vim review [--base REF] [--timeout SECS] [--socket PATH] [--open-browser]
+crit-vim review [--base REF] [--scope NAME] [--timeout SECS] [--socket PATH] [--open-browser]
 crit-vim status                                # proxy to `crit status --json`
-crit-vim doctor
+crit-vim doctor                                # includes plugin freshness check
 ```
+
+`--scope` values: `unstaged` | `staged` | `branch` | `all`. Corresponds to
+`GET /api/session?scope=<name>` and is applied client-side; the daemon's
+default focus is broader.
 
 `crit` companion (headless, no daemon required for `comment --clear` / `comment --reply-to`):
 
