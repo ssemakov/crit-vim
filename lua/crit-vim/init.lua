@@ -1999,6 +1999,10 @@ function M.setup(opts)
       { desc = "Crit: comment (motion / visual)" })
     vim.keymap.set("n", "<leader>CC", "<Plug>(CritCommentLine)",
       { desc = "Crit: comment current line" })
+    vim.keymap.set("n", "<leader>Cr", "<Plug>(CritReply)",
+      { desc = "Crit: reply to comment under cursor" })
+    vim.keymap.set("n", "<leader>Cx", "<Plug>(CritResolve)",
+      { desc = "Crit: toggle resolved" })
   end
 end
 

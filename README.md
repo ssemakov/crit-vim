@@ -232,7 +232,7 @@ safe. Or shortcut:
 
 ```lua
 require("crit-vim").setup({ default_keys = true })
--- binds <leader>C, <leader>CC (comment + comment-line) only.
+-- binds <leader>C, <leader>CC, <leader>Cr, <leader>Cx.
 ```
 
 ## Socket discovery
