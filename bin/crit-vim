@@ -139,6 +139,7 @@ cleanup_spawned_daemon() {
 
 cmd_review() {
   local base=""
+  local scope=""
   local timeout=14400
   local no_open_browser=1  # default: nvim is the UI, don't pop a browser
   FORCE_SOCKET="${FORCE_SOCKET:-}"
@@ -147,6 +148,8 @@ cmd_review() {
     case "$1" in
       --base) base="$2"; shift 2 ;;
       --base=*) base="${1#*=}"; shift ;;
+      --scope) scope="$2"; shift 2 ;;
+      --scope=*) scope="${1#*=}"; shift ;;
       --timeout) timeout="$2"; shift 2 ;;
       --timeout=*) timeout="${1#*=}"; shift ;;
       --socket) FORCE_SOCKET="$2"; shift 2 ;;
@@ -155,13 +158,29 @@ cmd_review() {
       --no-open-browser) no_open_browser=1; shift ;;
       --code|--json|--wait|--no-wait) shift ;;  # accepted for skill compat
       -h|--help) cat <<EOF
-usage: crit-vim review [--base REF] [--timeout SECS] [--socket PATH]
-                       [--open-browser | --no-open-browser]
+usage: crit-vim review [--base REF] [--scope NAME] [--timeout SECS]
+                       [--socket PATH] [--open-browser | --no-open-browser]
+
+  --base REF      Diff against REF. --base HEAD implies --scope unstaged.
+  --scope NAME    Narrow to a subset of the branch diff.
+                  Common values: unstaged, staged, branch, all.
 EOF
         return 0 ;;
       *) die "unknown option: $1" ;;
     esac
   done
+
+  # `--base HEAD` = "review my uncommitted work". Without --scope, crit's
+  # default focus is "everything since base-branch", which surprises users
+  # on branches with committed history. Map it explicitly to scope=unstaged.
+  if [[ "$base" == "HEAD" && -z "$scope" ]]; then
+    scope="unstaged"
+    base=""  # don't pass --range HEAD..HEAD (empty diff)
+  fi
+
+  # Fresh run: wipe any stale cancel sentinel from a previous session, so
+  # its result doesn't leak into this one.
+  rm -f "$HOME/.crit-vim/last-cancel" 2>/dev/null || true
 
   command -v crit >/dev/null 2>&1 || {
     cat >&2 <<'EOM'
@@ -216,7 +235,10 @@ EOM
     # Capture stderr so we can surface it if the daemon dies or is slow.
     local crit_log="/tmp/crit-vim.daemon.$$.log"
     local crit_args=(--no-open --quiet)
-    if [[ -n "$base" ]]; then
+    # `--base HEAD` explicitly means "unstaged changes" — passing --range
+    # HEAD..HEAD gives an empty diff, which is never what the user wants.
+    # Let crit auto-detect (which prefers unstaged when it exists).
+    if [[ -n "$base" && "$base" != "HEAD" ]]; then
       crit_args+=(--range "$base..HEAD")
     fi
     ( cd "$repo" && crit "${crit_args[@]}" ) >"$crit_log" 2>&1 &
@@ -282,9 +304,10 @@ print(json.dumps({
   'host': sys.argv[2],
   'review_path': sys.argv[3],
   'session_key': sys.argv[4],
+  'scope': sys.argv[5] or None,
   'base_branch': None,
 }))
-" "$port" "$host" "$review_path" "$key")
+" "$port" "$host" "$review_path" "$key" "$scope")
 
   # luaeval is finicky about the marshalled string; base64 it.
   local args_b64
@@ -345,6 +368,19 @@ EOM
       exit 124
     fi
   done
+
+  # If the nvim plugin wrote the cancel sentinel for THIS session key,
+  # treat the review as cancelled: don't send comments to the agent.
+  local cancel_sentinel="$HOME/.crit-vim/last-cancel"
+  if [[ -f "$cancel_sentinel" ]]; then
+    local cancelled_key
+    cancelled_key=$(cat "$cancel_sentinel" 2>/dev/null || echo "")
+    if [[ -z "$cancelled_key" || "$cancelled_key" == "$key" ]]; then
+      rm -f "$cancel_sentinel"
+      echo "crit-vim: review cancelled" >&2
+      exit 1
+    fi
+  fi
 
   # Print the review's comments as JSON. `crit comments --json` prints the
   # full review-file shape and is stable across versions.

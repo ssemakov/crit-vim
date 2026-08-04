@@ -279,7 +279,20 @@ local function tabedit_repo_file(repo, path)
   vim.cmd("tabedit " .. vim.fn.fnameescape(repo .. "/" .. path))
 end
 
+-- Pick the ref for the left-side ("base") diff buffer. For working-tree
+-- scopes (unstaged/staged), the meaningful base is HEAD — otherwise the
+-- diff includes every committed change on the branch and drowns the WIP.
+-- For branch/all/no-scope, the daemon-supplied base_ref (typically the
+-- default branch) is what we want.
+local function effective_base_ref()
+  if M.session and (M.session.scope == "unstaged" or M.session.scope == "staged") then
+    return "HEAD"
+  end
+  return M.session and M.session.base or "HEAD"
+end
+
 local function open_file_diff(file_info, base, repo)
+  base = effective_base_ref() or base
   -- Added: just the working-tree file, editable. No left side to diff
   -- against; the user reads top-to-bottom.
   if file_info.status == "added" then
@@ -548,6 +561,7 @@ function M.start_review_v2(args)
       host         = args.host or "127.0.0.1",
       review_path  = args.review_path,
       session_key  = args.session_key,
+      scope        = (args.scope and args.scope ~= vim.NIL) and args.scope or nil,
       repo         = repo_root() or vim.fn.getcwd(),
       base         = nil,      -- filled by /api/session
       files        = {},       -- filled by /api/session
@@ -560,14 +574,22 @@ function M.start_review_v2(args)
 
     -- Fetch the session snapshot synchronously via a blocking curl.
     local base = string.format("http://%s:%d", M.session.host, M.session.port)
-    local out = vim.fn.system({ "curl", "-sS", "--max-time", "5",
-      base .. "/api/session" })
+    local url = base .. "/api/session"
+    if M.session.scope then
+      url = url .. "?scope=" .. http.url_encode(M.session.scope)
+    end
+    local out = vim.fn.system({ "curl", "-sS", "--max-time", "5", url })
     assert(vim.v.shell_error == 0, "GET /api/session failed: " .. tostring(out))
     local sess = vim.json.decode(out)
     assert(sess, "malformed /api/session response")
 
     M.session.base = sess.base_ref
     M.session.branch = sess.branch
+    M.session.base_branch_name = sess.base_branch_name
+    local avail = sess.available_scopes
+    if avail == nil or avail == vim.NIL then avail = {} end
+    M.session.available_scopes = avail
+    M.session.focus_kind = (sess.focus and sess.focus.kind) or nil
     M.session.review_round = sess.review_round or 1
     -- crit returns `files: null` (decoded as vim.NIL, which is truthy) for an
     -- empty review — normalize to {} so we don't ipairs() a userdata value.
@@ -661,10 +683,60 @@ function M.start_review_v2(args)
     return false
   end
 
+  -- Show the effective scope + base branch so a "64 files unexpected!"
+  -- surprise is at least labeled.
+  local scope_info
+  if M.session.scope then
+    scope_info = " · scope=" .. M.session.scope
+  elseif M.session.focus_kind then
+    scope_info = " · scope=" .. M.session.focus_kind
+  else
+    scope_info = ""
+  end
+  if M.session.base_branch_name then
+    scope_info = scope_info .. " (vs " .. M.session.base_branch_name .. ")"
+  end
   vim.notify(string.format(
-    "crit-vim: %d file(s) · round %d · attached to crit @ port %d — :CritFinish to submit",
-    #M.session.files, M.session.review_round or 1, M.session.port), vim.log.levels.INFO)
+    "crit-vim: %d file(s) · round %d%s — :CritFinish to submit",
+    #M.session.files, M.session.review_round or 1, scope_info),
+    vim.log.levels.INFO)
   return true
+end
+
+-- Switch the review's scope by re-querying /api/session?scope=<name>
+-- and rebuilding tabs. Available scopes: see M.session.available_scopes
+-- (typically some of "unstaged", "staged", "branch", "all").
+function M.set_scope(name)
+  if not M.session then
+    vim.notify("crit-vim: no active review", vim.log.levels.WARN)
+    return
+  end
+  if not name or name == "" then
+    vim.notify(string.format("crit-vim: current scope=%s · available: %s",
+      M.session.scope or M.session.focus_kind or "?",
+      table.concat(M.session.available_scopes or {}, ", ")),
+      vim.log.levels.INFO)
+    return
+  end
+  local base = string.format("http://%s:%d", M.session.host, M.session.port)
+  local url = base .. "/api/session?scope=" .. http.url_encode(name)
+  local out = vim.fn.system({ "curl", "-sS", "--max-time", "5", url })
+  if vim.v.shell_error ~= 0 then
+    vim.notify("crit-vim: set-scope failed: " .. tostring(out),
+      vim.log.levels.ERROR)
+    return
+  end
+  local sess = vim.json.decode(out)
+  local files = sess and sess.files
+  if files == nil or files == vim.NIL then files = {} end
+  M.session.scope = name
+  M.session.files = {}
+  for _, sf in ipairs(files) do
+    table.insert(M.session.files, session_file_to_file_info(sf))
+  end
+  vim.notify(string.format("crit-vim: scope=%s (%d file(s))", name,
+    #M.session.files), vim.log.levels.INFO)
+  M.reopen()
 end
 
 -- Legacy entry point kept for backwards-compat. If the caller still passes
@@ -777,6 +849,23 @@ local function save_dirty_review_files()
   return saved, failed
 end
 
+-- Sentinel that :CritCancel writes and :CritFinish clears. Our bash CLI
+-- checks it after the daemon exits to know whether to pipe comments back
+-- to the agent (finish) or suppress them (cancel).
+local function cancel_sentinel_path() return vim.fn.expand("~/.crit-vim/last-cancel") end
+
+local function clear_cancel_sentinel()
+  pcall(os.remove, cancel_sentinel_path())
+end
+
+local function write_cancel_sentinel(session_key)
+  pcall(function()
+    vim.fn.mkdir(vim.fn.expand("~/.crit-vim"), "p")
+    local f = io.open(cancel_sentinel_path(), "w")
+    if f then f:write(session_key or ""); f:close() end
+  end)
+end
+
 function M.finish()
   if not M.session then
     vim.notify("crit-vim: no active review", vim.log.levels.WARN)
@@ -790,6 +879,9 @@ function M.finish()
     return
   end
   local n = count_comments(M.session)
+
+  -- Clear any stale cancel sentinel from a previous run.
+  clear_cancel_sentinel()
 
   -- Fire /api/finish (best effort) and stop the daemon so the blocked
   -- `crit --no-open` CLI exits. Do UI teardown + notification synchronously
@@ -824,9 +916,13 @@ function M.cancel()
       pcall(vim.api.nvim_buf_call, e.buf, function() vim.cmd("silent edit!") end)
     end
   end
+  -- Sentinel BEFORE stopping the daemon — the CLI's poll loop may exit as
+  -- soon as the daemon does, and it needs the sentinel to be present then.
+  write_cancel_sentinel(M.session.session_key)
   stop_crit_daemon()
   close_session("cancel")
-  vim.notify("crit-vim: review cancelled", vim.log.levels.WARN)
+  vim.notify("crit-vim: review cancelled — comments withheld from agent",
+    vim.log.levels.WARN)
 end
 
 -- ---------- comment authoring ----------
@@ -1785,6 +1881,12 @@ function M._register()
     { desc = "crit-vim: show plugin + CLI + session versions" })
   cmd("CritLog", function() M.show_log() end,
     { desc = "crit-vim: open the debug log file in a tab" })
+  cmd("CritScope", function(opts) M.set_scope(opts.args) end,
+    { nargs = "?", desc = "crit-vim: switch review scope (unstaged/staged/branch/all)",
+      complete = function()
+        return (M.session and M.session.available_scopes) or
+               { "unstaged", "staged", "branch", "all" }
+      end })
 
   -- <Plug> API. See README.
   function _G.crit_vim_op(_motion_type)
