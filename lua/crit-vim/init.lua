@@ -655,8 +655,10 @@ function M.start_review_v2(args)
       pcall(vim.api.nvim_set_current_tabpage, M.session.first_tab)
     end
 
-    M.render_all_comments()
-    M.render_sidebar()
+    -- Render is per-comment isolated inside itself, but a wrapper pcall
+    -- keeps a truly pathological comment from failing the whole attach.
+    pcall(M.render_all_comments)
+    pcall(M.render_sidebar)
 
     -- Subscribe to server-sent events. re-render on any content change;
     -- close the review UI on server shutdown.
@@ -1589,15 +1591,24 @@ function M._refresh_signs_for_file(file)
 
   local show_resolved = (M.session and M.session.show_resolved ~= false)
   for _, c in ipairs(comments) do
+    -- Isolate per-comment failures so one bad comment doesn't skip the rest.
+    local ok, err = pcall(function()
     if c.resolved and not show_resolved then
       -- Skip rendering entirely when the user has toggled resolved off.
-      goto continue
+      return
     end
     local buf = norm_side(c.side) == "left" and bufs.left or bufs.right
-    if vim.api.nvim_buf_is_valid(buf) then
+    if vim.api.nvim_buf_is_valid(buf)
+       and vim.api.nvim_buf_line_count(buf) > 0 then
       local line_count = vim.api.nvim_buf_line_count(buf)
       local start_l = math.max((c.start_line or 1) - 1, 0)
       local end_l   = math.min((c.end_line or c.start_line or 1) - 1, line_count - 1)
+      -- Skip if the comment's anchor is entirely out of the buffer (e.g.,
+      -- comment was left on a line that no longer exists after an edit, or
+      -- on the deleted-side of a scoped diff where the file has no left
+      -- content). Rendering it would either hit E5555 (extmark past EOB)
+      -- or land on the wrong line.
+      if start_l >= line_count then return end
       if end_l < start_l then end_l = start_l end
 
       -- Bar in the sign column + range background on every line of the
@@ -1703,7 +1714,12 @@ function M._refresh_signs_for_file(file)
         priority = 50,
       })
     end
-    ::continue::
+    end)  -- pcall wrapper
+    if not ok then
+      log(string.format("render comment %s failed: %s",
+        tostring(c.id or "?"), tostring(err)),
+        vim.log.levels.WARN, { silent = true })
+    end
   end
 end
 
