@@ -35,6 +35,8 @@ local function ensure_highlights()
     CritVimCommentReply   = { link = "NormalFloat" },     -- reply body text
     CritVimCommentReplyAuthor = { link = "Special" },     -- ↳ @author prefix
     CritVimCommentResolved = { link = "NonText", strikethrough = true }, -- resolved body
+    CritVimCommentResolvedBar    = { link = "NonText" },  -- dimmed sign bar
+    CritVimCommentResolvedBorder = { link = "NonText" },  -- dimmed border for folded resolved
     CritVimCommentDivider = { link = "FloatBorder" },     -- ┈┈┈ between replies
   }
   for name, spec in pairs(hls) do
@@ -1613,10 +1615,13 @@ function M._refresh_signs_for_file(file)
 
       -- Bar in the sign column + range background on every line of the
       -- comment span. One extmark per line so it survives partial edits.
+      -- Resolved threads get a dimmed bar and no range background — they
+      -- collapse visually into the diff.
       for l = start_l, end_l do
         vim.api.nvim_buf_set_extmark(buf, M._ns, l, 0, {
           sign_text = "▎",
-          sign_hl_group = "CritVimCommentBar",
+          sign_hl_group = c.resolved and "CritVimCommentResolvedBar"
+                                     or "CritVimCommentBar",
           line_hl_group = c.resolved and nil or "CritVimCommentRange",
           priority = 50,
         })
@@ -1624,84 +1629,112 @@ function M._refresh_signs_for_file(file)
 
       -- Bordered comment box rendered as virt_lines below the range.
       -- Body word-wrapped at `target_width`. Reply threads render inside
-      -- the same box, separated by a divider row.
+      -- the same box, separated by a divider row. Resolved threads
+      -- collapse to a single dimmed one-liner: no divider, no replies,
+      -- just a preview.
       local target_width = 76
-      local body_hl = c.resolved and "CritVimCommentResolved" or "CritVimCommentBody"
+      local virt
 
-      local resolved_marker = c.resolved and "  ✓ resolved" or ""
-      local author_line = "@" .. (c.author or "?") .. resolved_marker
+      if c.resolved then
+        -- Folded resolved thread: ✓ @author: body-preview (+N replies).
+        local preview = (c.body or ""):gsub("\r?\n.*$", "")
+        local n_replies = #(c.replies or {})
+        local suffix = n_replies > 0 and string.format(" (+%d)", n_replies) or ""
+        local text = string.format("✓ @%s: %s%s",
+          c.author or "?", preview, suffix)
+        -- Trim once to a compact width (no wrapping — the whole point is
+        -- one line).
+        local max = 88
+        if vim.fn.strdisplaywidth(text) > max then
+          -- Byte-wise cut is fine here — ASCII prefix (✓ is 3 bytes UTF-8
+          -- but at the start, so the cut point is well past it).
+          text = text:sub(1, max - 1) .. "…"
+        end
+        local w = vim.fn.strdisplaywidth(text)
+        virt = {
+          { { "╭" .. string.rep("─", w + 2) .. "╮", "CritVimCommentResolvedBorder" } },
+          {
+            { "│ ", "CritVimCommentResolvedBorder" },
+            { text, "CritVimCommentResolved" },
+            { " │", "CritVimCommentResolvedBorder" },
+          },
+          { { "╰" .. string.rep("─", w + 2) .. "╯", "CritVimCommentResolvedBorder" } },
+        }
+      else
+        local body_hl = "CritVimCommentBody"
+        local author_line = "@" .. (c.author or "?")
 
-      -- Sections = {section, section, ...} where each section is a list of
-      -- {text, hl} rows (with author already prefixed). Sections are joined
-      -- with a divider row between them.
-      local sections = {}
+        -- Sections = {section, section, ...} where each section is a list of
+        -- {text, hl} rows. Sections are joined with a divider row between them.
+        local sections = {}
 
-      local function wrap_body_into(rows, body, hl)
-        for _, bl in ipairs(vim.split(body or "", "\r?\n")) do
-          local segs = wrap_line(bl, target_width)
-          if #segs == 0 then
-            table.insert(rows, { "", hl })
-          else
-            for _, seg in ipairs(segs) do table.insert(rows, { seg, hl }) end
+        local function wrap_body_into(rows, body, hl)
+          for _, bl in ipairs(vim.split(body or "", "\r?\n")) do
+            local segs = wrap_line(bl, target_width)
+            if #segs == 0 then
+              table.insert(rows, { "", hl })
+            else
+              for _, seg in ipairs(segs) do table.insert(rows, { seg, hl }) end
+            end
           end
         end
-      end
 
-      -- Root section (the comment itself).
-      local root_rows = {}
-      for _, seg in ipairs(wrap_line(author_line, target_width)) do
-        table.insert(root_rows, { seg, "CritVimCommentBody" })
-      end
-      table.insert(root_rows, { "", body_hl })  -- spacer under header
-      wrap_body_into(root_rows, c.body, body_hl)
-      table.insert(sections, root_rows)
-
-      -- Reply sections.
-      for _, r in ipairs(c.replies or {}) do
-        local reply_rows = {}
-        local prefix = "↳ @" .. (r.author or "?")
-        for _, seg in ipairs(wrap_line(prefix, target_width)) do
-          table.insert(reply_rows, { seg, "CritVimCommentReplyAuthor" })
+        -- Root section (the comment itself).
+        local root_rows = {}
+        for _, seg in ipairs(wrap_line(author_line, target_width)) do
+          table.insert(root_rows, { seg, "CritVimCommentBody" })
         end
-        table.insert(reply_rows, { "", "CritVimCommentReply" })
-        wrap_body_into(reply_rows, r.body, "CritVimCommentReply")
-        table.insert(sections, reply_rows)
-      end
+        table.insert(root_rows, { "", body_hl })  -- spacer under header
+        wrap_body_into(root_rows, c.body, body_hl)
+        table.insert(sections, root_rows)
 
-      -- Compute the box's inner width from the widest rendered row.
-      local inner_width = 20
-      for _, sec in ipairs(sections) do
-        for _, row in ipairs(sec) do
-          inner_width = math.max(inner_width, vim.fn.strdisplaywidth(row[1]))
+        -- Reply sections.
+        for _, r in ipairs(c.replies or {}) do
+          local reply_rows = {}
+          local prefix = "↳ @" .. (r.author or "?")
+          for _, seg in ipairs(wrap_line(prefix, target_width)) do
+            table.insert(reply_rows, { seg, "CritVimCommentReplyAuthor" })
+          end
+          table.insert(reply_rows, { "", "CritVimCommentReply" })
+          wrap_body_into(reply_rows, r.body, "CritVimCommentReply")
+          table.insert(sections, reply_rows)
         end
-      end
-      if inner_width > target_width then inner_width = target_width end
 
-      local border_top    = "╭" .. string.rep("─", inner_width + 2) .. "╮"
-      local border_bottom = "╰" .. string.rep("─", inner_width + 2) .. "╯"
-      local divider       = "├" .. string.rep("┈", inner_width + 2) .. "┤"
-
-      local virt = { { { border_top, "CritVimCommentBorder" } } }
-
-      local function push_row(text, hl)
-        local pad = inner_width - vim.fn.strdisplaywidth(text)
-        if pad < 0 then pad = 0 end
-        table.insert(virt, {
-          { "│ ",                        "CritVimCommentBorder" },
-          { text,                        hl },
-          { string.rep(" ", pad) .. " ", hl },
-          { "│",                         "CritVimCommentBorder" },
-        })
-      end
-
-      for i, sec in ipairs(sections) do
-        if i > 1 then
-          table.insert(virt, { { divider, "CritVimCommentDivider" } })
+        -- Compute the box's inner width from the widest rendered row.
+        local inner_width = 20
+        for _, sec in ipairs(sections) do
+          for _, row in ipairs(sec) do
+            inner_width = math.max(inner_width, vim.fn.strdisplaywidth(row[1]))
+          end
         end
-        for _, row in ipairs(sec) do push_row(row[1], row[2]) end
-      end
+        if inner_width > target_width then inner_width = target_width end
 
-      table.insert(virt, { { border_bottom, "CritVimCommentBorder" } })
+        local border_top    = "╭" .. string.rep("─", inner_width + 2) .. "╮"
+        local border_bottom = "╰" .. string.rep("─", inner_width + 2) .. "╯"
+        local divider       = "├" .. string.rep("┈", inner_width + 2) .. "┤"
+
+        virt = { { { border_top, "CritVimCommentBorder" } } }
+
+        local function push_row(text, hl)
+          local pad = inner_width - vim.fn.strdisplaywidth(text)
+          if pad < 0 then pad = 0 end
+          table.insert(virt, {
+            { "│ ",                        "CritVimCommentBorder" },
+            { text,                        hl },
+            { string.rep(" ", pad) .. " ", hl },
+            { "│",                         "CritVimCommentBorder" },
+          })
+        end
+
+        for i, sec in ipairs(sections) do
+          if i > 1 then
+            table.insert(virt, { { divider, "CritVimCommentDivider" } })
+          end
+          for _, row in ipairs(sec) do push_row(row[1], row[2]) end
+        end
+
+        table.insert(virt, { { border_bottom, "CritVimCommentBorder" } })
+      end
 
       -- Nvim clips virt_lines rendered below the last buffer line. Flip
       -- the anchor to above `start_l` when the comment sits on the last
