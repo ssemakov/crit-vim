@@ -204,15 +204,24 @@ local function set_review_buffer(buf, file, side, syntax_for)
   end
 end
 
--- Force the user's preferred line number + a visible signcolumn on a diff
--- window. Without this, distros that hide numbers on `buftype=nofile`
--- (LazyVim does) leave the gutter blank for added/deleted files (modified
--- files survive because `:diffthis` keeps the column).
+-- Force line numbers + signcolumn on a diff window. Reviewers rely on line
+-- numbers to talk about ranges; distros that hide them on `buftype=nofile`
+-- (LazyVim's default) leave the gutter blank for our scratch base-side
+-- buffers, and even the working-tree side can lose numbers to a late
+-- BufWinEnter ftplugin. We set them synchronously and re-apply on the next
+-- tick so post-load autocmds don't undo us.
 local function set_diff_window_options(win)
-  win = win or 0
-  vim.wo[win].number         = vim.go.number
-  vim.wo[win].relativenumber = vim.go.relativenumber
-  vim.wo[win].signcolumn     = "yes"
+  win = (not win or win == 0) and vim.api.nvim_get_current_win() or win
+  local function apply()
+    if not vim.api.nvim_win_is_valid(win) then return end
+    pcall(function()
+      vim.wo[win].number         = true
+      vim.wo[win].relativenumber = vim.go.relativenumber
+      vim.wo[win].signcolumn     = "yes"
+    end)
+  end
+  apply()
+  vim.schedule(apply)
 end
 
 -- Clear the review markers when a buffer is no longer part of a review.
@@ -1878,6 +1887,23 @@ function M._register()
     { group = group, callback = function() M.register_socket() end })
   vim.api.nvim_create_autocmd("TabEnter",
     { group = group, callback = function() M._reposition_sidebar_cursor() end })
+
+  -- Some ftplugins / other plugins toggle number/signcolumn on
+  -- BufWinEnter after we set them. Re-apply on every WinEnter into a
+  -- review buffer so the gutter stays populated.
+  vim.api.nvim_create_autocmd({ "WinEnter", "BufWinEnter" }, {
+    group = group,
+    callback = function(args)
+      if not M.session then return end
+      if not vim.b[args.buf].crit_vim_file then return end
+      local win = vim.api.nvim_get_current_win()
+      pcall(function()
+        vim.wo[win].number         = true
+        vim.wo[win].relativenumber = vim.go.relativenumber
+        vim.wo[win].signcolumn     = "yes"
+      end)
+    end,
+  })
 
   local function cmd(name, fn, opts)
     opts = opts or {}
