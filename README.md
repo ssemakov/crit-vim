@@ -62,7 +62,8 @@ return {
       { "<leader>CC", "<Plug>(CritCommentLine)", mode = "n",          desc = "Crit: comment line" },
       { "<leader>Cr", "<Plug>(CritReply)",       mode = "n",          desc = "Crit: reply" },
       { "<leader>Cx", "<Plug>(CritResolve)",     mode = "n",          desc = "Crit: toggle resolve" },
-      { "<leader>Ct", "<Plug>(CritThreadList)",  mode = "n",          desc = "Crit: unresolved threads" },
+      { "<leader>Ct", "<Plug>(CritNextThread)",  mode = "n",          desc = "Crit: next unresolved thread" },
+      { "<leader>CT", "<Plug>(CritPrevThread)",  mode = "n",          desc = "Crit: prev unresolved thread" },
       { "]C",         "<Plug>(CritNextThread)",  mode = "n",          desc = "Crit: next thread" },
       { "[C",         "<Plug>(CritPrevThread)",  mode = "n",          desc = "Crit: prev thread" },
     },
@@ -271,7 +272,7 @@ safe. Or shortcut:
 
 ```lua
 require("crit-vim").setup({ default_keys = true })
--- binds <leader>C, <leader>CC, <leader>Cr, <leader>Cx, <leader>Ct, ]C, [C.
+-- binds <leader>C{,C,r,x,t,T} and ]C/[C.
 ```
 
 ## Socket discovery

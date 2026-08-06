@@ -387,7 +387,6 @@ end
 --   { kind = "thread", file = "…", comment_id = "c_…", line = 42 }
 -- Rows without meta (headers, blanks) are inert.
 local function sidebar_lines()
-  local data = read_review_file()
   local rows = {}
   local meta = {}
 
@@ -405,10 +404,19 @@ local function sidebar_lines()
   local threads = {}  -- { {path, line, body, n_replies, comment_id}, ... }
   local path_w = SIDEBAR_WIDTH - 10
 
-  -- Preserve session file order; index by path for quick lookup.
+  -- Query per-file comments via the daemon's in-memory state (HTTP GET,
+  -- no debounce race). Falls back to the on-disk review file if the
+  -- daemon is momentarily unreachable.
   local file_to_comments = {}
-  for path, fdata in pairs(data.files or {}) do
-    file_to_comments[path] = fdata.comments or {}
+  local disk_data
+  for _, fi in ipairs(M.session.files) do
+    local comments = api_get_file_comments(fi.path)
+    if not comments then
+      disk_data = disk_data or read_review_file()
+      local fdata = disk_data.files and disk_data.files[fi.path]
+      comments = (fdata and fdata.comments) or {}
+    end
+    file_to_comments[fi.path] = comments
   end
 
   -- File section.
@@ -500,6 +508,15 @@ local function ensure_sidebar_buf()
     { buffer = buf, desc = "crit-vim: unresolve thread" })
   vim.keymap.set("n", "d", function() M._sidebar_delete() end,
     { buffer = buf, desc = "crit-vim: delete thread" })
+
+  -- Preview: as the cursor moves through thread rows in the sidebar, jump
+  -- the diff to that thread's file+line but keep focus in the sidebar so
+  -- j/k continues to work. No preview on file rows (would spam tab
+  -- switches while scrolling past the file list).
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    buffer = buf,
+    callback = function() M._sidebar_preview() end,
+  })
 
   M.session.sidebar_buf = buf
   return buf
@@ -604,6 +621,29 @@ local function sidebar_thread_at_cursor()
   local m = M.session._sidebar_meta and M.session._sidebar_meta[row]
   if not m or m.kind ~= "thread" then return nil end
   return m
+end
+
+-- Called from a CursorMoved autocmd on the sidebar buffer. If the cursor
+-- is on a thread row, jump the diff to file+line and return focus to the
+-- sidebar so j/k keeps navigating the list.
+function M._sidebar_preview()
+  local m = sidebar_thread_at_cursor()
+  if not m then return end
+  local sidebar_win = vim.api.nvim_get_current_win()
+  jump_to_file_tab(m.file, m.line)
+  local tab = vim.api.nvim_get_current_tabpage()
+  -- Find the sidebar window in the (possibly-switched) tab and refocus.
+  for _, bufs in pairs(M.session.file_bufs or {}) do
+    if bufs.tab == tab and bufs.sidebar_win
+       and vim.api.nvim_win_is_valid(bufs.sidebar_win) then
+      pcall(vim.api.nvim_set_current_win, bufs.sidebar_win)
+      return
+    end
+  end
+  -- Fallback: same window (only relevant if the tab didn't change).
+  if vim.api.nvim_win_is_valid(sidebar_win) then
+    pcall(vim.api.nvim_set_current_win, sidebar_win)
+  end
 end
 
 function M._sidebar_next_thread(direction)
@@ -2289,8 +2329,10 @@ function M.setup(opts)
       { desc = "Crit: reply to comment under cursor" })
     vim.keymap.set("n", "<leader>Cx", "<Plug>(CritResolve)",
       { desc = "Crit: toggle resolved" })
-    vim.keymap.set("n", "<leader>Ct", "<Plug>(CritThreadList)",
-      { desc = "Crit: unresolved thread list" })
+    vim.keymap.set("n", "<leader>Ct", "<Plug>(CritNextThread)",
+      { desc = "Crit: next unresolved thread" })
+    vim.keymap.set("n", "<leader>CT", "<Plug>(CritPrevThread)",
+      { desc = "Crit: prev unresolved thread" })
     vim.keymap.set("n", "]C", "<Plug>(CritNextThread)",
       { desc = "Crit: next unresolved thread" })
     vim.keymap.set("n", "[C", "<Plug>(CritPrevThread)",
