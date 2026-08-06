@@ -374,24 +374,96 @@ local function status_glyph(st)
   return "?"
 end
 
+-- Truncate `p` from the LEFT so the filename stays visible (which is
+-- usually more identifying than the dir prefix).
+local function trunc_path_left(p, width)
+  if vim.fn.strdisplaywidth(p) <= width then return p end
+  return "…" .. p:sub(-(width - 1))
+end
+
+-- Build the sidebar rows and a parallel meta table indexed by row number.
+-- meta[row] describes what action `<CR>` on that row should do:
+--   { kind = "file",   file = "…" }
+--   { kind = "thread", file = "…", comment_id = "c_…", line = 42 }
+-- Rows without meta (headers, blanks) are inert.
 local function sidebar_lines()
   local data = read_review_file()
-  local total = 0
-  local rows = { "", "" }  -- header filled in last
-  local path_w = SIDEBAR_WIDTH - 10
-  for _, fi in ipairs(M.session.files) do
-    local fdata = data.files and data.files[fi.path]
-    local n = (fdata and #(fdata.comments or {})) or 0
-    total = total + n
-    local p = fi.path
-    if #p > path_w then p = "…" .. p:sub(-(path_w - 1)) end
-    local count = n > 0 and string.format("[%d]", n) or ""
-    rows[#rows + 1] = string.format(" %s  %-" .. path_w .. "s %s",
-      status_glyph(fi.status), p, count)
+  local rows = {}
+  local meta = {}
+
+  local function push(line, m)
+    rows[#rows + 1] = line
+    meta[#rows] = m
   end
-  rows[1] = string.format("crit-vim — %d file%s · %d comment%s",
+
+  -- Header (placeholder; totals filled in after the scan).
+  push("", nil)
+  push("", nil)
+
+  local total = 0
+  local unresolved = 0
+  local threads = {}  -- { {path, line, body, n_replies, comment_id}, ... }
+  local path_w = SIDEBAR_WIDTH - 10
+
+  -- Preserve session file order; index by path for quick lookup.
+  local file_to_comments = {}
+  for path, fdata in pairs(data.files or {}) do
+    file_to_comments[path] = fdata.comments or {}
+  end
+
+  -- File section.
+  for _, fi in ipairs(M.session.files) do
+    local comments = file_to_comments[fi.path] or {}
+    local n = #comments
+    total = total + n
+    for _, c in ipairs(comments) do
+      if not c.resolved then
+        unresolved = unresolved + 1
+        table.insert(threads, {
+          path       = fi.path,
+          line       = c.start_line or 1,
+          body       = c.body or "",
+          n_replies  = #(c.replies or {}),
+          comment_id = c.id,
+        })
+      end
+    end
+    local count = n > 0 and string.format("[%d]", n) or ""
+    push(
+      string.format(" %s  %-" .. path_w .. "s %s",
+        status_glyph(fi.status), trunc_path_left(fi.path, path_w), count),
+      { kind = "file", file = fi.path }
+    )
+  end
+
+  -- Unresolved threads section.
+  if #threads > 0 then
+    push("", nil)
+    push(string.format("── unresolved (%d) " ..
+      string.rep("─", math.max(1, SIDEBAR_WIDTH - 20)), unresolved), nil)
+    for _, t in ipairs(threads) do
+      local suffix = t.n_replies > 0
+        and string.format(" (+%d)", t.n_replies) or ""
+      local header_text = trunc_path_left(t.path, SIDEBAR_WIDTH - 12)
+      push(string.format(" %s:%d%s", header_text, t.line, suffix),
+        { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
+      local preview = t.body:gsub("\r?\n.*$", ""):gsub("^%s+", "")
+      preview = trunc_path_left(preview, SIDEBAR_WIDTH - 4):gsub("^…", "")
+      if vim.fn.strdisplaywidth(preview) > SIDEBAR_WIDTH - 4 then
+        preview = preview:sub(1, SIDEBAR_WIDTH - 5) .. "…"
+      end
+      push("   " .. preview,
+        { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
+    end
+  end
+
+  rows[1] = string.format("crit-vim — %d file%s · %d comment%s · %d unresolved",
     #M.session.files, #M.session.files == 1 and "" or "s",
-    total, total == 1 and "" or "s")
+    total, total == 1 and "" or "s", unresolved)
+
+  -- Persist the meta table on the session so <CR> / next-thread can use it.
+  M.session._sidebar_meta = meta
+  M.session._sidebar_threads = threads
   return rows
 end
 
@@ -409,13 +481,25 @@ local function ensure_sidebar_buf()
   vim.bo[buf].modifiable = false
 
   vim.keymap.set("n", "<CR>", function() M._sidebar_jump() end,
-    { buffer = buf, desc = "crit-vim: jump to file" })
+    { buffer = buf, desc = "crit-vim: jump" })
   vim.keymap.set("n", "<2-LeftMouse>", function() M._sidebar_jump() end,
     { buffer = buf })
   vim.keymap.set("n", "q", function() M.sidebar_toggle() end,
     { buffer = buf, desc = "crit-vim: close sidebar" })
   vim.keymap.set("n", "R", function() M.render_sidebar() end,
     { buffer = buf, desc = "crit-vim: refresh sidebar" })
+  vim.keymap.set("n", "]t", function() M._sidebar_next_thread(1) end,
+    { buffer = buf, desc = "crit-vim: next thread" })
+  vim.keymap.set("n", "[t", function() M._sidebar_next_thread(-1) end,
+    { buffer = buf, desc = "crit-vim: prev thread" })
+  vim.keymap.set("n", "r", function() M._sidebar_reply() end,
+    { buffer = buf, desc = "crit-vim: reply to thread" })
+  vim.keymap.set("n", "x", function() M._sidebar_resolve(true) end,
+    { buffer = buf, desc = "crit-vim: resolve thread" })
+  vim.keymap.set("n", "X", function() M._sidebar_resolve(false) end,
+    { buffer = buf, desc = "crit-vim: unresolve thread" })
+  vim.keymap.set("n", "d", function() M._sidebar_delete() end,
+    { buffer = buf, desc = "crit-vim: delete thread" })
 
   M.session.sidebar_buf = buf
   return buf
@@ -433,13 +517,21 @@ end
 function M._reposition_sidebar_cursor()
   if not M.session then return end
   local tab = vim.api.nvim_get_current_tabpage()
-  local idx = file_index_for_tab(tab)
-  if not idx then return end
-  local row = SIDEBAR_HEADER_ROWS + idx
+  local idx, fi = file_index_for_tab(tab)
+  if not idx or not fi then return end
+  -- Find the row for this file in the sidebar via the meta table.
+  local target_row
+  for r, m in pairs(M.session._sidebar_meta or {}) do
+    if m and m.kind == "file" and m.file == fi.path then
+      target_row = r
+      break
+    end
+  end
+  if not target_row then return end
   for _, bufs in pairs(M.session.file_bufs) do
     if bufs.tab == tab and bufs.sidebar_win
        and vim.api.nvim_win_is_valid(bufs.sidebar_win) then
-      pcall(vim.api.nvim_win_set_cursor, bufs.sidebar_win, { row, 0 })
+      pcall(vim.api.nvim_win_set_cursor, bufs.sidebar_win, { target_row, 0 })
       return
     end
   end
@@ -456,24 +548,203 @@ function M.render_sidebar()
   M._reposition_sidebar_cursor()
 end
 
+-- Jump to the tab of `file` and land in the rightmost non-sidebar window.
+local function jump_to_file_tab(file, line)
+  local bufs = M.session and M.session.file_bufs[file]
+  if not bufs or not bufs.tab or not vim.api.nvim_tabpage_is_valid(bufs.tab) then
+    return false
+  end
+  vim.api.nvim_set_current_tabpage(bufs.tab)
+  local target
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(bufs.tab)) do
+    if w ~= bufs.sidebar_win then target = w end
+  end
+  if target then
+    pcall(vim.api.nvim_set_current_win, target)
+    if line then
+      -- Prefer landing on the right (working-tree) side for right-side
+      -- comments — that's where the user will edit.
+      local rbuf = bufs.right
+      if rbuf and vim.api.nvim_buf_is_valid(rbuf) then
+        for _, w in ipairs(vim.api.nvim_tabpage_list_wins(bufs.tab)) do
+          if vim.api.nvim_win_get_buf(w) == rbuf then
+            pcall(vim.api.nvim_set_current_win, w)
+            target = w
+            break
+          end
+        end
+      end
+      local lc = vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(target))
+      local safe = math.max(1, math.min(line, lc))
+      pcall(vim.api.nvim_win_set_cursor, target, { safe, 0 })
+    end
+  end
+  return true
+end
+
 function M._sidebar_jump()
   if not M.session then return end
   local row = vim.api.nvim_win_get_cursor(0)[1]
-  local idx = row - SIDEBAR_HEADER_ROWS
-  local fi = M.session.files[idx]
-  if not fi then return end
-  local bufs = M.session.file_bufs[fi.path]
-  if not bufs or not bufs.tab or not vim.api.nvim_tabpage_is_valid(bufs.tab) then return end
-  vim.api.nvim_set_current_tabpage(bufs.tab)
-  -- Land in the rightmost diff window of the target tab.
-  local target
-  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(bufs.tab)) do
-    if w ~= bufs.sidebar_win then target = w end  -- last non-sidebar wins
-  end
-  if target then pcall(vim.api.nvim_set_current_win, target) end
+  local m = M.session._sidebar_meta and M.session._sidebar_meta[row]
+  if not m then return end
+  jump_to_file_tab(m.file, m.line)
 end
 
-local function open_sidebar_in_current_tab()
+-- Forward-declared: real definitions are further down in the file. Kept
+-- as locals with deferred assignment so this block (which references them)
+-- parses cleanly.
+local open_comment_buffer
+local open_sidebar_in_current_tab
+
+-- Helpers below act on the thread whose row the cursor currently sits on
+-- inside the sidebar. Silent no-op if the cursor is on a file / header row.
+local function sidebar_thread_at_cursor()
+  if not M.session then return nil end
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local m = M.session._sidebar_meta and M.session._sidebar_meta[row]
+  if not m or m.kind ~= "thread" then return nil end
+  return m
+end
+
+function M._sidebar_next_thread(direction)
+  if not M.session then return end
+  local meta = M.session._sidebar_meta or {}
+  local win = vim.api.nvim_get_current_win()
+  local row = vim.api.nvim_win_get_cursor(win)[1]
+  local buf = vim.api.nvim_win_get_buf(win)
+  local n = vim.api.nvim_buf_line_count(buf)
+  local step = direction >= 0 and 1 or -1
+  local r = row + step
+  while r >= 1 and r <= n do
+    local m = meta[r]
+    if m and m.kind == "thread" then
+      pcall(vim.api.nvim_win_set_cursor, win, { r, 0 })
+      return
+    end
+    r = r + step
+  end
+end
+
+function M._sidebar_reply()
+  local m = sidebar_thread_at_cursor()
+  if not m then
+    vim.notify("crit-vim: cursor not on a thread row", vim.log.levels.WARN)
+    return
+  end
+  -- Piggyback the same floating comment editor used by `:CritReply`.
+  open_comment_buffer({
+    file = m.file, side = "right",
+    start_line = m.line, end_line = m.line,
+    quote = nil, anchor = nil,
+    reply_to = m.comment_id,
+  })
+end
+
+function M._sidebar_resolve(desired)
+  local m = sidebar_thread_at_cursor()
+  if not m then
+    vim.notify("crit-vim: cursor not on a thread row", vim.log.levels.WARN)
+    return
+  end
+  M._api_set_resolved(m.file, m.comment_id, desired, function(ok)
+    if ok then
+      M._refresh_signs_for_file(m.file)
+      M.render_sidebar()
+      vim.notify(string.format("crit-vim: thread %s",
+        desired and "resolved" or "unresolved"), vim.log.levels.INFO)
+    end
+  end)
+end
+
+function M._sidebar_delete()
+  local m = sidebar_thread_at_cursor()
+  if not m then
+    vim.notify("crit-vim: cursor not on a thread row", vim.log.levels.WARN)
+    return
+  end
+  local resp = vim.fn.input(string.format(
+    "delete thread on %s:%d? (y/N) ", m.file, m.line))
+  if (resp or ""):lower() ~= "y" then
+    vim.notify("crit-vim: delete cancelled", vim.log.levels.INFO)
+    return
+  end
+  M._api_delete_comment(m.file, m.comment_id, function(ok)
+    if ok then
+      M._refresh_signs_for_file(m.file)
+      M.render_sidebar()
+      vim.notify("crit-vim: thread deleted", vim.log.levels.INFO)
+    end
+  end)
+end
+
+-- Open the sidebar in the current tab and land the cursor on the first
+-- thread row (or the first file row if there are no threads).
+function M.open_thread_list()
+  if not M.session then
+    vim.notify("crit-vim: no active review", vim.log.levels.WARN)
+    return
+  end
+  ensure_sidebar_buf()
+  -- Reuse open_sidebar_in_current_tab, then jump the cursor.
+  open_sidebar_in_current_tab()
+  local sidebar_win
+  for _, bufs in pairs(M.session.file_bufs) do
+    if bufs.tab == vim.api.nvim_get_current_tabpage() and bufs.sidebar_win
+       and vim.api.nvim_win_is_valid(bufs.sidebar_win) then
+      sidebar_win = bufs.sidebar_win
+      break
+    end
+  end
+  if not sidebar_win then return end
+  pcall(vim.api.nvim_set_current_win, sidebar_win)
+  local meta = M.session._sidebar_meta or {}
+  for r = 1, #vim.api.nvim_buf_get_lines(M.session.sidebar_buf, 0, -1, false) do
+    if meta[r] and meta[r].kind == "thread" then
+      pcall(vim.api.nvim_win_set_cursor, sidebar_win, { r, 0 })
+      return
+    end
+  end
+end
+
+-- Jump between unresolved threads from anywhere in the review (diff
+-- windows, sidebar, etc.). direction >= 0 = next, < 0 = previous.
+-- Order = file order, then start_line ascending.
+function M.next_thread(direction)
+  if not M.session then return end
+  local threads = M.session._sidebar_threads or {}
+  if #threads == 0 then
+    vim.notify("crit-vim: no unresolved threads", vim.log.levels.INFO)
+    return
+  end
+  local step = direction >= 0 and 1 or -1
+  local cur_file = vim.b.crit_vim_file
+  local cur_line = cur_file and vim.api.nvim_win_get_cursor(0)[1] or nil
+
+  -- Find our current position in the ordered thread list. If not on a
+  -- review buffer, pick 0 (so step forward = first thread).
+  local pos = 0
+  if cur_file and cur_line then
+    for i, t in ipairs(threads) do
+      if t.path == cur_file and t.line == cur_line then
+        pos = i
+        break
+      elseif t.path == cur_file and t.line > cur_line and step > 0 then
+        pos = i - 1
+        break
+      elseif t.path == cur_file and t.line < cur_line and step < 0 then
+        pos = i + 1
+        break
+      end
+    end
+  end
+  local target = pos + step
+  if target < 1 then target = #threads end
+  if target > #threads then target = 1 end
+  local t = threads[target]
+  jump_to_file_tab(t.path, t.line)
+end
+
+function open_sidebar_in_current_tab()  -- assigns forward-declared local
   if not M.session then return end
   ensure_sidebar_buf()
   local tab = vim.api.nvim_get_current_tabpage()
@@ -982,7 +1253,7 @@ local function review_buffer_info()
   return bufnr, side, file
 end
 
-local function open_comment_buffer(ctx)
+function open_comment_buffer(ctx)  -- assigns forward-declared local
   local buf = vim.api.nvim_create_buf(false, true)
   -- acwrite + BufWriteCmd so `:w` (and `ZZ`) saves the comment without
   -- needing a real file on disk.
@@ -1954,6 +2225,12 @@ function M._register()
     { desc = "crit-vim: show plugin + CLI + session versions" })
   cmd("CritLog", function() M.show_log() end,
     { desc = "crit-vim: open the debug log file in a tab" })
+  cmd("CritThreadList", function() M.open_thread_list() end,
+    { desc = "crit-vim: focus sidebar on unresolved threads" })
+  cmd("CritNextThread", function() M.next_thread(1) end,
+    { desc = "crit-vim: jump to next unresolved thread" })
+  cmd("CritPrevThread", function() M.next_thread(-1) end,
+    { desc = "crit-vim: jump to previous unresolved thread" })
   cmd("CritScope", function(opts) M.set_scope(opts.args) end,
     { nargs = "?", desc = "crit-vim: switch review scope (unstaged/staged/branch/all)",
       complete = function()
@@ -1987,6 +2264,15 @@ function M._register()
 
   vim.keymap.set("n", "<Plug>(CritResolve)", function() M.toggle_resolved_at_cursor() end,
     { desc = "crit-vim: toggle resolved on comment under cursor" })
+
+  vim.keymap.set("n", "<Plug>(CritThreadList)", function() M.open_thread_list() end,
+    { desc = "crit-vim: open sidebar on the unresolved threads list" })
+
+  vim.keymap.set("n", "<Plug>(CritNextThread)", function() M.next_thread(1) end,
+    { desc = "crit-vim: jump to next unresolved thread" })
+
+  vim.keymap.set("n", "<Plug>(CritPrevThread)", function() M.next_thread(-1) end,
+    { desc = "crit-vim: jump to previous unresolved thread" })
 end
 
 -- Optional convenience for users who don't want to write their own `keys`
@@ -2003,6 +2289,12 @@ function M.setup(opts)
       { desc = "Crit: reply to comment under cursor" })
     vim.keymap.set("n", "<leader>Cx", "<Plug>(CritResolve)",
       { desc = "Crit: toggle resolved" })
+    vim.keymap.set("n", "<leader>Ct", "<Plug>(CritThreadList)",
+      { desc = "Crit: unresolved thread list" })
+    vim.keymap.set("n", "]C", "<Plug>(CritNextThread)",
+      { desc = "Crit: next unresolved thread" })
+    vim.keymap.set("n", "[C", "<Plug>(CritPrevThread)",
+      { desc = "Crit: prev unresolved thread" })
   end
 end
 
