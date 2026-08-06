@@ -2,6 +2,10 @@
 
 ![crit-vim in Neovim](img/nvim-screenshot.png)
 
+> **Beta.** This plugin is under active development and rough edges are
+> expected. Please file bugs and feature requests at
+> [GitHub issues](https://github.com/ssemakov/crit-vim/issues).
+
 Nvim-native client for [tomasz-tomczyk/crit](https://github.com/tomasz-tomczyk/crit).
 Attaches to a running crit daemon, gives you a vim buffer per changed file
 with inline comment cards, and rides on crit's schema for threads, resolve
