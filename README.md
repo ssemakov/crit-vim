@@ -35,10 +35,16 @@ sync in real time via SSE, and you don't lose comments when nvim restarts.
 
 **1. Install crit (the daemon).**
 
+Pinned to `v0.18.4` — the release this version of crit-vim was built and
+tested against. Newer 0.18.x versions may work; 0.19+ is unverified.
+
 ```sh
+# Homebrew installs the current release; verify the version afterwards.
 brew install crit
-# or:
-go install github.com/tomasz-tomczyk/crit/cmd/crit@latest
+crit --version                                            # expect: crit 0.18.4
+
+# Or install a specific version via Go:
+go install github.com/tomasz-tomczyk/crit/cmd/crit@v0.18.4
 ```
 
 **2. Install the plugin.**
@@ -81,7 +87,8 @@ crit-vim doctor
 
 Should list your nvim's socket + crit binary + session-file path.
 
-Requires: Neovim 0.10+, `git`, `curl`, `python3`, `bash`, `crit` >= 0.18.
+Requires: Neovim 0.10+, `git`, `curl`, `python3`, `bash`, `crit` 0.18.4
+(other 0.18.x may work; 0.19+ is unverified).
 
 ## Usage
 
