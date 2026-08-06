@@ -401,7 +401,9 @@ local function sidebar_lines()
 
   local total = 0
   local unresolved = 0
-  local threads = {}  -- { {path, line, body, n_replies, comment_id}, ... }
+  local resolved_count = 0
+  local threads = {}           -- unresolved
+  local resolved_threads = {}  -- resolved (folded look)
   local path_w = SIDEBAR_WIDTH - 10
 
   -- Query per-file comments via the daemon's in-memory state (HTTP GET,
@@ -425,15 +427,19 @@ local function sidebar_lines()
     local n = #comments
     total = total + n
     for _, c in ipairs(comments) do
-      if not c.resolved then
+      local entry = {
+        path       = fi.path,
+        line       = c.start_line or 1,
+        body       = c.body or "",
+        n_replies  = #(c.replies or {}),
+        comment_id = c.id,
+      }
+      if c.resolved then
+        resolved_count = resolved_count + 1
+        table.insert(resolved_threads, entry)
+      else
         unresolved = unresolved + 1
-        table.insert(threads, {
-          path       = fi.path,
-          line       = c.start_line or 1,
-          body       = c.body or "",
-          n_replies  = #(c.replies or {}),
-          comment_id = c.id,
-        })
+        table.insert(threads, entry)
       end
     end
     local count = n > 0 and string.format("[%d]", n) or ""
@@ -444,25 +450,37 @@ local function sidebar_lines()
     )
   end
 
+  local function push_thread_entry(t)
+    local suffix = t.n_replies > 0
+      and string.format(" (+%d)", t.n_replies) or ""
+    local header_text = trunc_path_left(t.path, SIDEBAR_WIDTH - 12)
+    push(string.format(" %s:%d%s", header_text, t.line, suffix),
+      { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
+    local preview = t.body:gsub("\r?\n.*$", ""):gsub("^%s+", "")
+    preview = trunc_path_left(preview, SIDEBAR_WIDTH - 4):gsub("^…", "")
+    if vim.fn.strdisplaywidth(preview) > SIDEBAR_WIDTH - 4 then
+      preview = preview:sub(1, SIDEBAR_WIDTH - 5) .. "…"
+    end
+    push("   " .. preview,
+      { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
+  end
+
   -- Unresolved threads section.
   if #threads > 0 then
     push("", nil)
     push(string.format("── unresolved (%d) " ..
       string.rep("─", math.max(1, SIDEBAR_WIDTH - 20)), unresolved), nil)
-    for _, t in ipairs(threads) do
-      local suffix = t.n_replies > 0
-        and string.format(" (+%d)", t.n_replies) or ""
-      local header_text = trunc_path_left(t.path, SIDEBAR_WIDTH - 12)
-      push(string.format(" %s:%d%s", header_text, t.line, suffix),
-        { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
-      local preview = t.body:gsub("\r?\n.*$", ""):gsub("^%s+", "")
-      preview = trunc_path_left(preview, SIDEBAR_WIDTH - 4):gsub("^…", "")
-      if vim.fn.strdisplaywidth(preview) > SIDEBAR_WIDTH - 4 then
-        preview = preview:sub(1, SIDEBAR_WIDTH - 5) .. "…"
-      end
-      push("   " .. preview,
-        { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
-    end
+    for _, t in ipairs(threads) do push_thread_entry(t) end
+  end
+
+  -- Resolved threads section. Same rows (so `X` from a resolved row works
+  -- naturally), just under a distinct header. Compact for now — could dim
+  -- later if we want a visual difference.
+  if #resolved_threads > 0 then
+    push("", nil)
+    push(string.format("── resolved (%d) " ..
+      string.rep("─", math.max(1, SIDEBAR_WIDTH - 18)), resolved_count), nil)
+    for _, t in ipairs(resolved_threads) do push_thread_entry(t) end
   end
 
   rows[1] = string.format("crit-vim — %d file%s · %d comment%s · %d unresolved",
@@ -558,11 +576,34 @@ function M.render_sidebar()
   if not M.session or not M.session.sidebar_buf then return end
   local buf = M.session.sidebar_buf
   if not vim.api.nvim_buf_is_valid(buf) then return end
+
+  -- Save cursor position of every window currently showing the sidebar
+  -- so re-render (after resolve / delete / reply) doesn't yank the user
+  -- back to the top or to the "current file" row.
+  local saved = {}
+  for _, bufs in pairs(M.session.file_bufs or {}) do
+    local w = bufs.sidebar_win
+    if w and vim.api.nvim_win_is_valid(w)
+       and vim.api.nvim_win_get_buf(w) == buf then
+      saved[w] = vim.api.nvim_win_get_cursor(w)
+    end
+  end
+
   local lines = sidebar_lines()
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
-  M._reposition_sidebar_cursor()
+
+  local n = vim.api.nvim_buf_line_count(buf)
+  for w, pos in pairs(saved) do
+    pcall(vim.api.nvim_win_set_cursor, w, { math.min(math.max(pos[1], 1), n), pos[2] })
+  end
+
+  -- Only sync-to-current-file when the user isn't already navigating
+  -- inside the sidebar (i.e. some other window has focus).
+  if not saved[vim.api.nvim_get_current_win()] then
+    M._reposition_sidebar_cursor()
+  end
 end
 
 -- Jump to the tab of `file` and land in the rightmost non-sidebar window.
@@ -686,10 +727,29 @@ function M._sidebar_resolve(desired)
     vim.notify("crit-vim: cursor not on a thread row", vim.log.levels.WARN)
     return
   end
+  local sidebar_win = vim.api.nvim_get_current_win()
+  local target_id = m.comment_id
   M._api_set_resolved(m.file, m.comment_id, desired, function(ok)
     if ok then
       M._refresh_signs_for_file(m.file)
       M.render_sidebar()
+      -- render_sidebar clamps the saved cursor row. That row now shows
+      -- either the next thread in the SAME section (good — natural
+      -- adjacency) or a header/blank (bad — the resolved thread was the
+      -- last one in its section). In the latter case, find our just-
+      -- transitioned comment in the OTHER section and land there.
+      if vim.api.nvim_win_is_valid(sidebar_win) then
+        local row = vim.api.nvim_win_get_cursor(sidebar_win)[1]
+        local meta = M.session._sidebar_meta or {}
+        if not (meta[row] and meta[row].kind == "thread") then
+          for r, mm in pairs(meta) do
+            if mm and mm.kind == "thread" and mm.comment_id == target_id then
+              pcall(vim.api.nvim_win_set_cursor, sidebar_win, { r, 0 })
+              break
+            end
+          end
+        end
+      end
       vim.notify(string.format("crit-vim: thread %s",
         desired and "resolved" or "unresolved"), vim.log.levels.INFO)
     end

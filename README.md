@@ -124,9 +124,9 @@ Binary files are skipped automatically (detected via a NUL byte in the
 first 8KB of `git show`).
 
 In nvim, one diff tab opens per changed file, with a sidebar on the left
-listing files and comment counts. Below the file list, when there are any
-unresolved comment threads, the sidebar shows a threads section — each
-entry is `path:line` + first-body preview:
+listing files and comment counts. Below the file list, the sidebar shows
+two thread sections — unresolved first, then resolved — each entry is
+`path:line` + first-body preview:
 
 ```
 ── unresolved (3) ───────────────
@@ -134,7 +134,14 @@ entry is `path:line` + first-body preview:
    why extract if only one caller?
  README.md:42
    this should handle EOF and…
+── resolved (2) ─────────────────
+ lua/crit-vim/init.lua:88
+   fixed in b7f2a1
 ```
+
+Moving the cursor onto a thread row live-previews it — the diff scrolls
+to that line and focus stays in the sidebar, so `j`/`k` continues to
+navigate.
 
 Sidebar keys:
 
