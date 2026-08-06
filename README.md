@@ -130,11 +130,19 @@ two thread sections — unresolved first, then resolved — each entry is
 
 ```
 ── unresolved (3) ─────────────────
- lua/crit-vim/init.lua:118 (+2) · why extract if only one caller?
- README.md:42 · this should handle EOF and return an error…
+ lua/crit-vim/init.lua
+  :42 · why extract if only one caller?
+  :88 (+1) · nit — extract
+ README.md
+  :12 · this should handle EOF and return…
 ── resolved (2) ───────────────────
- lua/crit-vim/init.lua:88 · fixed in b7f2a1
+ lua/crit-vim/init.lua
+  :120 · fixed in b7f2a1
 ```
+
+Threads are grouped by file (path shown once, threads indented). `j`/`k`
+in the sidebar skip section headers and file rows, landing only on
+actionable rows.
 
 Moving the cursor onto a thread row live-previews it — the diff scrolls
 to that line and focus stays in the sidebar, so `j`/`k` continues to

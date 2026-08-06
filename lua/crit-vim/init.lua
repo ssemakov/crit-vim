@@ -457,23 +457,29 @@ local function sidebar_lines()
     )
   end
 
-  -- Single-line thread entry so j/k moves exactly one thread at a time.
-  -- Format: ` path:line (+N) · preview…`. The header (path:line) gets a
-  -- generous slice; the preview takes what remains.
-  local function push_thread_entry(t)
-    local reply_suffix = t.n_replies > 0
-      and string.format(" (+%d)", t.n_replies) or ""
-    local header = trunc_path_left(t.path, math.floor(SIDEBAR_WIDTH * 0.45))
-       .. ":" .. tostring(t.line) .. reply_suffix
-    local body = t.body:gsub("\r?\n.*$", ""):gsub("^%s+", "")
-    -- Reserve 3 cells for leading space, `·`, and trailing padding.
-    local room_for_preview = SIDEBAR_WIDTH - vim.fn.strdisplaywidth(header) - 4
-    local preview = ""
-    if body ~= "" and room_for_preview > 4 then
-      preview = " · " .. trunc_right(body, room_for_preview)
+  -- Group threads by file: one file-header row, then one row per thread
+  -- indented under it (no repeated path). j/k moves through rows one at a
+  -- time; use `]t`/`[t` to jump between threads and skip file headers.
+  local function push_thread_group(section_threads)
+    local last_file
+    for _, t in ipairs(section_threads) do
+      if t.path ~= last_file then
+        push(" " .. trunc_path_left(t.path, SIDEBAR_WIDTH - 2), nil)
+        last_file = t.path
+      end
+      local reply_suffix = t.n_replies > 0
+        and string.format(" (+%d)", t.n_replies) or ""
+      local line_col = ":" .. tostring(t.line) .. reply_suffix
+      local body = t.body:gsub("\r?\n.*$", ""):gsub("^%s+", "")
+      -- Row starts with 3-space indent + line marker. Preview fills the rest.
+      local room_for_preview = SIDEBAR_WIDTH - vim.fn.strdisplaywidth(line_col) - 6
+      local preview = ""
+      if body ~= "" and room_for_preview > 4 then
+        preview = " · " .. trunc_right(body, room_for_preview)
+      end
+      push("  " .. line_col .. preview,
+        { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
     end
-    push(" " .. header .. preview,
-      { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
   end
 
   -- Unresolved threads section.
@@ -481,7 +487,7 @@ local function sidebar_lines()
     push("", nil)
     push(string.format("── unresolved (%d) " ..
       string.rep("─", math.max(1, SIDEBAR_WIDTH - 20)), unresolved), nil)
-    for _, t in ipairs(threads) do push_thread_entry(t) end
+    push_thread_group(threads)
   end
 
   -- Resolved threads section. Same rows (so `X` from a resolved row works
@@ -491,7 +497,7 @@ local function sidebar_lines()
     push("", nil)
     push(string.format("── resolved (%d) " ..
       string.rep("─", math.max(1, SIDEBAR_WIDTH - 18)), resolved_count), nil)
-    for _, t in ipairs(resolved_threads) do push_thread_entry(t) end
+    push_thread_group(resolved_threads)
   end
 
   rows[1] = string.format("crit-vim — %d file%s · %d comment%s · %d unresolved",
@@ -525,6 +531,12 @@ local function ensure_sidebar_buf()
     { buffer = buf, desc = "crit-vim: close sidebar" })
   vim.keymap.set("n", "R", function() M.render_sidebar() end,
     { buffer = buf, desc = "crit-vim: refresh sidebar" })
+  -- j/k skip inert rows (blanks, section headers, in-thread file headers)
+  -- so movement always lands on something with an action attached.
+  vim.keymap.set("n", "j", function() M._sidebar_step(1) end,
+    { buffer = buf, desc = "crit-vim: next actionable row" })
+  vim.keymap.set("n", "k", function() M._sidebar_step(-1) end,
+    { buffer = buf, desc = "crit-vim: prev actionable row" })
   vim.keymap.set("n", "]t", function() M._sidebar_next_thread(1) end,
     { buffer = buf, desc = "crit-vim: next thread" })
   vim.keymap.set("n", "[t", function() M._sidebar_next_thread(-1) end,
@@ -696,6 +708,32 @@ function M._sidebar_preview()
   if vim.api.nvim_win_is_valid(sidebar_win) then
     pcall(vim.api.nvim_set_current_win, sidebar_win)
   end
+end
+
+-- Move cursor to the next row with a non-nil meta entry, in `direction`.
+-- Falls back to a normal j/k if there is no such row (e.g. cursor is
+-- already past the last actionable row).
+function M._sidebar_step(direction)
+  if not M.session then return end
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_win_get_buf(win)
+  local meta = M.session._sidebar_meta or {}
+  local row = vim.api.nvim_win_get_cursor(win)[1]
+  local n = vim.api.nvim_buf_line_count(buf)
+  local step = direction >= 0 and 1 or -1
+  local r = row + step
+  while r >= 1 and r <= n do
+    if meta[r] then
+      pcall(vim.api.nvim_win_set_cursor, win, { r, 0 })
+      return
+    end
+    r = r + step
+  end
+  -- Nothing actionable in that direction; behave like normal j/k so the
+  -- cursor still moves (avoids feeling stuck).
+  local delta = step == 1 and 1 or -1
+  local dst = math.min(math.max(row + delta, 1), n)
+  pcall(vim.api.nvim_win_set_cursor, win, { dst, 0 })
 end
 
 function M._sidebar_next_thread(direction)
