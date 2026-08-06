@@ -129,14 +129,11 @@ two thread sections — unresolved first, then resolved — each entry is
 `path:line` + first-body preview:
 
 ```
-── unresolved (3) ───────────────
- lua/crit-vim/init.lua:118 (+2)
-   why extract if only one caller?
- README.md:42
-   this should handle EOF and…
-── resolved (2) ─────────────────
- lua/crit-vim/init.lua:88
-   fixed in b7f2a1
+── unresolved (3) ─────────────────
+ lua/crit-vim/init.lua:118 (+2) · why extract if only one caller?
+ README.md:42 · this should handle EOF and return an error…
+── resolved (2) ───────────────────
+ lua/crit-vim/init.lua:88 · fixed in b7f2a1
 ```
 
 Moving the cursor onto a thread row live-previews it — the diff scrolls

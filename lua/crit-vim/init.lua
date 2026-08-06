@@ -457,16 +457,22 @@ local function sidebar_lines()
     )
   end
 
+  -- Single-line thread entry so j/k moves exactly one thread at a time.
+  -- Format: ` path:line (+N) · preview…`. The header (path:line) gets a
+  -- generous slice; the preview takes what remains.
   local function push_thread_entry(t)
-    local suffix = t.n_replies > 0
+    local reply_suffix = t.n_replies > 0
       and string.format(" (+%d)", t.n_replies) or ""
-    local header_text = trunc_path_left(t.path, SIDEBAR_WIDTH - 12)
-    push(string.format(" %s:%d%s", header_text, t.line, suffix),
-      { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
-    local preview = trunc_right(
-      t.body:gsub("\r?\n.*$", ""):gsub("^%s+", ""),
-      SIDEBAR_WIDTH - 4)
-    push("   " .. preview,
+    local header = trunc_path_left(t.path, math.floor(SIDEBAR_WIDTH * 0.45))
+       .. ":" .. tostring(t.line) .. reply_suffix
+    local body = t.body:gsub("\r?\n.*$", ""):gsub("^%s+", "")
+    -- Reserve 3 cells for leading space, `·`, and trailing padding.
+    local room_for_preview = SIDEBAR_WIDTH - vim.fn.strdisplaywidth(header) - 4
+    local preview = ""
+    if body ~= "" and room_for_preview > 4 then
+      preview = " · " .. trunc_right(body, room_for_preview)
+    end
+    push(" " .. header .. preview,
       { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
   end
 
