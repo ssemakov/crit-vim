@@ -1,9 +1,21 @@
--- crit-vim: review an agent's diff inside the user's running nvim and ship
--- comments back as crit-shape JSON.
+-- crit-vim: nvim-native client for tomasz-tomczyk/crit.
+--
+-- The plugin no longer owns review-session state; it attaches to a running
+-- `crit` daemon and:
+--   • reads the review file (~/.crit/reviews/<key>/review.json) for comments
+--   • writes comments via /api/* HTTP endpoints
+--   • listens on /api/events (SSE) for real-time updates from any client
+--     (browser tab, `crit comment` CLI, or another nvim)
+--
+-- Legacy `M.start_review(session_dir)` is retained (calls into v2 shim) so
+-- older CLI wrappers keep working; new invocations use `start_review_v2`.
+
+local http = require("crit-vim.http")
+local sse  = require("crit-vim.sse")
 
 local M = {}
 
-M.session = nil          -- {dir, base, repo, files, file_bufs, tab_pages}
+M.session = nil          -- see start_review_v2 for shape
 M._comment_ctx = {}      -- bufnr -> draft context
 M._ns = vim.api.nvim_create_namespace("crit_vim")
 
@@ -15,11 +27,17 @@ M._ns = vim.api.nvim_create_namespace("crit_vim")
 -- explicit border around it.
 local function ensure_highlights()
   local hls = {
-    CritVimCommentBar    = { link = "DiagnosticInfo" },  -- signcolumn bar
-    CritVimCommentRange  = { link = "DiffChange" },      -- background of the commented range
-    CritVimCommentBorder = { link = "FloatBorder" },     -- ╭─╮│╰─╯ around the box
-    CritVimCommentBody   = { link = "NormalFloat" },     -- box interior text + padding
-    CritVimCommentMeta   = { link = "NonText" },         -- resolved marker etc.
+    CritVimCommentBar     = { link = "DiagnosticInfo" },  -- signcolumn bar
+    CritVimCommentRange   = { link = "DiffChange" },      -- background of the commented range
+    CritVimCommentBorder  = { link = "FloatBorder" },     -- ╭─╮│╰─╯ around the box
+    CritVimCommentBody    = { link = "NormalFloat" },     -- box interior text + padding
+    CritVimCommentMeta    = { link = "NonText" },         -- resolved marker etc.
+    CritVimCommentReply   = { link = "NormalFloat" },     -- reply body text
+    CritVimCommentReplyAuthor = { link = "Special" },     -- ↳ @author prefix
+    CritVimCommentResolved = { link = "NonText", strikethrough = true }, -- resolved body
+    CritVimCommentResolvedBar    = { link = "NonText" },  -- dimmed sign bar
+    CritVimCommentResolvedBorder = { link = "NonText" },  -- dimmed border for folded resolved
+    CritVimCommentDivider = { link = "FloatBorder" },     -- ┈┈┈ between replies
   }
   for name, spec in pairs(hls) do
     spec.default = true
@@ -32,6 +50,33 @@ vim.api.nvim_create_autocmd("ColorScheme", {
   group = vim.api.nvim_create_augroup("crit_vim_highlights", { clear = true }),
   callback = ensure_highlights,
 })
+
+-- ---------- logging ----------
+--
+-- Always appends to ~/.crit-vim/debug.log so a user hitting a bug on another
+-- machine can share the file with a maintainer. Also emits vim.notify by
+-- default (silenced when opts.silent).
+
+local function log_path() return vim.fn.expand("~/.crit-vim/debug.log") end
+
+local function log(msg, level, opts)
+  level = level or vim.log.levels.INFO
+  opts = opts or {}
+  if not opts.silent then
+    pcall(vim.notify, msg, level)
+  end
+  pcall(function()
+    vim.fn.mkdir(vim.fn.expand("~/.crit-vim"), "p")
+    local f = io.open(log_path(), "a")
+    if f then
+      local lvl = ({ [0] = "TRACE", [1] = "DEBUG", [2] = "INFO",
+                     [3] = "WARN", [4] = "ERROR", [5] = "OFF" })[level] or "?"
+      f:write(string.format("[%s] %-5s %s\n",
+        os.date("!%Y-%m-%dT%H:%M:%SZ"), lvl, msg))
+      f:close()
+    end
+  end)
+end
 
 -- ---------- filesystem / json helpers ----------
 
@@ -56,6 +101,51 @@ local function read_json(path)
   local ok, data = pcall(vim.json.decode, s)
   if not ok then return nil end
   return data
+end
+
+-- Read the crit review file (written atomically by the daemon on every
+-- mutation, whether from browser/CLI/our HTTP posts). Returns a normalised
+-- {files, review_comments} table; empty tables when the file is absent.
+-- Placed high in the file because sidebar/render code calls it before the
+-- lifecycle helpers are declared.
+local function read_review_file()
+  if not M.session or not M.session.review_path then
+    return { files = {}, review_comments = {} }
+  end
+  local data = read_json(M.session.review_path .. "/review.json")
+        or { files = {}, review_comments = {} }
+  if type(data.files) ~= "table" then data.files = {} end
+  if type(data.review_comments) ~= "table" then data.review_comments = {} end
+  return data
+end
+
+-- Legacy alias kept for internal call sites still using load_comments().
+local function load_comments()
+  return read_review_file()
+end
+
+-- Normalize the wire-format `side` field to our buffer-marker convention
+-- ("right" / "left"). tomasz-crit stores right-side as "" (omitempty) and
+-- left-side as "old"; older writers may use "right" / "left" literally.
+local function norm_side(s)
+  if s == "old" or s == "left" then return "left" end
+  return "right"
+end
+
+-- Blocking GET /api/file/comments?path=X. Returns a list of comments (may
+-- be empty) or nil on error. Fetches in-memory session state, so it sees
+-- writes that haven't yet been flushed to review.json by the daemon's
+-- debounced writer — no post-POST staleness.
+local function api_get_file_comments(file)
+  if not M.session then return nil end
+  local url = string.format("http://%s:%d/api/file/comments?path=%s",
+    M.session.host, M.session.port, http.url_encode(file))
+  local out = vim.fn.system({ "curl", "-sS", "--max-time", "3", url })
+  if vim.v.shell_error ~= 0 then return nil end
+  local ok, decoded = pcall(vim.json.decode, out)
+  if not ok then return nil end
+  if type(decoded) ~= "table" then return {} end
+  return decoded
 end
 
 local function write_json(path, data)
@@ -114,15 +204,24 @@ local function set_review_buffer(buf, file, side, syntax_for)
   end
 end
 
--- Force the user's preferred line number + a visible signcolumn on a diff
--- window. Without this, distros that hide numbers on `buftype=nofile`
--- (LazyVim does) leave the gutter blank for added/deleted files (modified
--- files survive because `:diffthis` keeps the column).
+-- Force line numbers + signcolumn on a diff window. Reviewers rely on line
+-- numbers to talk about ranges; distros that hide them on `buftype=nofile`
+-- (LazyVim's default) leave the gutter blank for our scratch base-side
+-- buffers, and even the working-tree side can lose numbers to a late
+-- BufWinEnter ftplugin. We set them synchronously and re-apply on the next
+-- tick so post-load autocmds don't undo us.
 local function set_diff_window_options(win)
-  win = win or 0
-  vim.wo[win].number         = vim.go.number
-  vim.wo[win].relativenumber = vim.go.relativenumber
-  vim.wo[win].signcolumn     = "yes"
+  win = (not win or win == 0) and vim.api.nvim_get_current_win() or win
+  local function apply()
+    if not vim.api.nvim_win_is_valid(win) then return end
+    pcall(function()
+      vim.wo[win].number         = true
+      vim.wo[win].relativenumber = vim.go.relativenumber
+      vim.wo[win].signcolumn     = "yes"
+    end)
+  end
+  apply()
+  vim.schedule(apply)
 end
 
 -- Clear the review markers when a buffer is no longer part of a review.
@@ -149,6 +248,36 @@ local function git_show(repo, ref, path)
   return lines
 end
 
+-- Detect binary content by reading the first ~8KB of `path` in `ref` (or the
+-- working tree if `ref == nil`) and scanning for a NUL byte. `git diff` uses
+-- the same heuristic. Returns true for binary files (images, PDFs, etc.).
+local function is_binary_file(repo, ref, path)
+  local abs = repo .. "/" .. path
+  local data
+  if ref then
+    -- `git show` writes raw bytes to stdout; systemlist splits on newline and
+    -- would drop NULs, so use system() and read as string.
+    data = vim.fn.system({ "git", "-C", repo, "show", ref .. ":" .. path })
+    if vim.v.shell_error ~= 0 then data = nil end
+  else
+    local f = io.open(abs, "rb")
+    if f then data = f:read(8192); f:close() end
+  end
+  if not data or data == "" then return false end
+  return data:sub(1, 8192):find("\0", 1, true) ~= nil
+end
+
+-- nvim_buf_set_name errors with E95 if another buffer already claims the
+-- name (typical when a prior review left scratch buffers around). Wipe the
+-- collider first, then set.
+local function safe_set_buf_name(buf, name)
+  local existing = vim.fn.bufnr(name)
+  if existing > 0 and existing ~= buf and vim.api.nvim_buf_is_valid(existing) then
+    pcall(vim.api.nvim_buf_delete, existing, { force = true })
+  end
+  vim.api.nvim_buf_set_name(buf, name)
+end
+
 -- Mark a real-file buffer as part of the review (so :CritComment etc. can
 -- find it) without making it read-only — the user may want to edit.
 local function mark_real_review_buffer(buf, file, side)
@@ -161,7 +290,20 @@ local function tabedit_repo_file(repo, path)
   vim.cmd("tabedit " .. vim.fn.fnameescape(repo .. "/" .. path))
 end
 
+-- Pick the ref for the left-side ("base") diff buffer. For working-tree
+-- scopes (unstaged/staged), the meaningful base is HEAD — otherwise the
+-- diff includes every committed change on the branch and drowns the WIP.
+-- For branch/all/no-scope, the daemon-supplied base_ref (typically the
+-- default branch) is what we want.
+local function effective_base_ref()
+  if M.session and (M.session.scope == "unstaged" or M.session.scope == "staged") then
+    return "HEAD"
+  end
+  return M.session and M.session.base or "HEAD"
+end
+
 local function open_file_diff(file_info, base, repo)
+  base = effective_base_ref() or base
   -- Added: just the working-tree file, editable. No left side to diff
   -- against; the user reads top-to-bottom.
   if file_info.status == "added" then
@@ -178,7 +320,7 @@ local function open_file_diff(file_info, base, repo)
   if file_info.status == "deleted" then
     vim.cmd("tabnew")
     local buf = vim.api.nvim_get_current_buf()
-    vim.api.nvim_buf_set_name(buf, file_info.path .. " [deleted]")
+    safe_set_buf_name(buf, file_info.path .. " [deleted]")
     fill_buffer(buf, git_show(repo, base, file_info.old_path or file_info.path))
     set_review_buffer(buf, file_info.path, "left", file_info.path)
     set_diff_window_options(0)
@@ -197,7 +339,7 @@ local function open_file_diff(file_info, base, repo)
 
   vim.cmd("leftabove vsplit | enew")
   local left_buf = vim.api.nvim_get_current_buf()
-  vim.api.nvim_buf_set_name(left_buf, file_info.path .. " [" .. base .. "]")
+  safe_set_buf_name(left_buf, file_info.path .. " [" .. base .. "]")
   fill_buffer(left_buf, git_show(repo, base, file_info.old_path or file_info.path))
   set_review_buffer(left_buf, file_info.path, "left", file_info.path)
   vim.cmd("diffthis")
@@ -233,7 +375,7 @@ local function status_glyph(st)
 end
 
 local function sidebar_lines()
-  local data = read_json(M.session.dir .. "/comments.json") or { files = {} }
+  local data = read_review_file()
   local total = 0
   local rows = { "", "" }  -- header filled in last
   local path_w = SIDEBAR_WIDTH - 10
@@ -258,7 +400,7 @@ local function ensure_sidebar_buf()
   if existing and vim.api.nvim_buf_is_valid(existing) then return existing end
 
   local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_name(buf, "critvim://sidebar")
+  safe_set_buf_name(buf, "critvim://sidebar")
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].swapfile = false
@@ -392,60 +534,232 @@ end
 -- Forward-declared; defined below.
 local close_session
 
-function M.start_review(session_dir)
+-- Convert a SessionInfo `files` entry from /api/session into the file_info
+-- shape our open_file_diff expects.
+local function session_file_to_file_info(sf)
+  local status = sf.status or "modified"
+  -- Server returns "untracked" for new-but-unstaged files; treat as added.
+  if status == "untracked" then status = "added" end
+  return {
+    path = sf.path,
+    status = status,
+    old_path = sf.old_path,
+  }
+end
+
+-- Entry point for the new CLI: attach to a running crit daemon.
+-- args = { port, host, review_path, session_key }
+function M.start_review_v2(args)
+  log(string.format("start_review_v2 port=%d host=%s key=%s review_path=%s",
+    tonumber(args.port or 0) or 0,
+    tostring(args.host or "?"),
+    tostring(args.session_key or "?"),
+    tostring(args.review_path or "?")), vim.log.levels.INFO, { silent = true })
   if M.session then
-    -- A previous session is stale (user ran <C-w>o, the agent died, etc).
-    -- Cancel it so its bash reader unblocks, then start fresh.
-    vim.notify("crit-vim: cancelling stale review and starting new", vim.log.levels.WARN)
-    close_session("cancel")
+    vim.notify("crit-vim: replacing stale review with new attach", vim.log.levels.WARN)
+    log("replacing stale session", vim.log.levels.WARN, { silent = true })
+    close_session("replaced")
   end
 
   local ok, err = pcall(function()
-    local meta = read_json(session_dir .. "/meta.json")
-    assert(meta, "cannot read meta.json")
-    assert(meta.repo_root and meta.base and meta.files, "meta.json missing fields")
+    assert(args and args.port and args.review_path,
+      "start_review_v2: port and review_path required")
 
     ensure_highlights()
 
     M.session = {
-      dir = session_dir,
-      base = meta.base,
-      repo = meta.repo_root,
-      files = meta.files,
-      file_bufs = {},
-      first_tab = nil,
+      port         = args.port,
+      host         = args.host or "127.0.0.1",
+      review_path  = args.review_path,
+      session_key  = args.session_key,
+      scope        = (args.scope and args.scope ~= vim.NIL) and args.scope or nil,
+      repo         = repo_root() or vim.fn.getcwd(),
+      base         = nil,      -- filled by /api/session
+      files        = {},       -- filled by /api/session
+      file_bufs    = {},
+      first_tab    = nil,
+      sse          = nil,      -- subscription handle
+      show_resolved = true,    -- toggle via :CritToggleResolved
+      pending_render = {},     -- de-dupe scheduled per-file refreshes
     }
 
-    for i, file_info in ipairs(meta.files) do
-      local bufs = open_file_diff(file_info, meta.base, meta.repo_root)
-      M.session.file_bufs[file_info.path] = bufs
-      if i == 1 then M.session.first_tab = bufs.tab end
-      open_sidebar_in_current_tab()
+    -- Fetch the session snapshot synchronously via a blocking curl.
+    local base = string.format("http://%s:%d", M.session.host, M.session.port)
+    local url = base .. "/api/session"
+    if M.session.scope then
+      url = url .. "?scope=" .. http.url_encode(M.session.scope)
+    end
+    local out = vim.fn.system({ "curl", "-sS", "--max-time", "5", url })
+    assert(vim.v.shell_error == 0, "GET /api/session failed: " .. tostring(out))
+    local sess = vim.json.decode(out)
+    assert(sess, "malformed /api/session response")
+
+    M.session.base = sess.base_ref
+    M.session.branch = sess.branch
+    M.session.base_branch_name = sess.base_branch_name
+    local avail = sess.available_scopes
+    if avail == nil or avail == vim.NIL then avail = {} end
+    M.session.available_scopes = avail
+    M.session.focus_kind = (sess.focus and sess.focus.kind) or nil
+    M.session.review_round = sess.review_round or 1
+    -- crit returns `files: null` (decoded as vim.NIL, which is truthy) for an
+    -- empty review — normalize to {} so we don't ipairs() a userdata value.
+    local files = sess.files
+    if files == nil or files == vim.NIL then files = {} end
+    for _, sf in ipairs(files) do
+      table.insert(M.session.files, session_file_to_file_info(sf))
+    end
+
+    if #M.session.files == 0 then
+      vim.notify("crit-vim: no changed files in this session", vim.log.levels.WARN)
+    end
+
+    -- Filter out binary files up front — we can't render meaningful diffs
+    -- for them and `git show` fills scratch buffers with garbage. For added
+    -- files the source of truth is the working tree; otherwise the base ref.
+    local text_files = {}
+    local skipped_binary = 0
+    for _, fi in ipairs(M.session.files) do
+      local binary
+      if fi.status == "added" then
+        binary = is_binary_file(M.session.repo, nil, fi.path)
+      else
+        binary = is_binary_file(M.session.repo, M.session.base,
+          fi.old_path or fi.path)
+      end
+      if binary then
+        skipped_binary = skipped_binary + 1
+        log("skipping binary file: " .. fi.path,
+          vim.log.levels.DEBUG, { silent = true })
+      else
+        table.insert(text_files, fi)
+      end
+    end
+    M.session.files = text_files
+    if skipped_binary > 0 then
+      log(string.format("crit-vim: skipped %d binary file(s)", skipped_binary),
+        vim.log.levels.INFO)
+    end
+
+    local total = #M.session.files
+    for i, file_info in ipairs(M.session.files) do
+      -- Progress ping every 5 files (or on last) so large reviews don't
+      -- look stalled. Silent in the log; visible via vim.notify.
+      if total > 10 and (i == 1 or i % 5 == 0 or i == total) then
+        log(string.format("crit-vim: loading %d/%d (%s)",
+          i, total, file_info.path), vim.log.levels.INFO)
+        vim.cmd("redraw")
+      end
+      local ok_open, err_or_bufs = pcall(open_file_diff, file_info,
+        M.session.base, M.session.repo)
+      if not ok_open then
+        log(string.format("crit-vim: failed to open %s: %s",
+          file_info.path, tostring(err_or_bufs)), vim.log.levels.WARN)
+      else
+        M.session.file_bufs[file_info.path] = err_or_bufs
+        if not M.session.first_tab then M.session.first_tab = err_or_bufs.tab end
+        open_sidebar_in_current_tab()
+      end
     end
 
     if M.session.first_tab then
       pcall(vim.api.nvim_set_current_tabpage, M.session.first_tab)
     end
 
-    M.render_all_comments()
-    M.render_sidebar()
+    -- Render is per-comment isolated inside itself, but a wrapper pcall
+    -- keeps a truly pathological comment from failing the whole attach.
+    pcall(M.render_all_comments)
+    pcall(M.render_sidebar)
+
+    -- Subscribe to server-sent events. re-render on any content change;
+    -- close the review UI on server shutdown.
+    M.session.sse = sse.subscribe({
+      base_url = base,
+      on_event = function(ev_type, _data)
+        if ev_type == "comments-changed"
+           or ev_type == "file-changed"
+           or ev_type == "base-changed" then
+          M.render_all_comments()
+          M.render_sidebar()
+        elseif ev_type == "server-shutdown" then
+          vim.notify("crit-vim: crit daemon shut down", vim.log.levels.INFO)
+          close_session("shutdown")
+        end
+      end,
+    })
   end)
 
   if not ok then
     local msg = tostring(err)
-    pcall(write_file, session_dir .. "/error", msg)
-    pcall(write_file, session_dir .. "/result", "error")
-    -- Best-effort: signal the FIFO so the bash reader unblocks.
-    pcall(write_file, session_dir .. "/done", "\n")
     M.session = nil
-    vim.notify("crit-vim: start_review failed: " .. msg, vim.log.levels.ERROR)
+    vim.notify("crit-vim: start_review_v2 failed: " .. msg, vim.log.levels.ERROR)
     return false
   end
 
+  -- Show the effective scope + base branch so a "64 files unexpected!"
+  -- surprise is at least labeled.
+  local scope_info
+  if M.session.scope then
+    scope_info = " · scope=" .. M.session.scope
+  elseif M.session.focus_kind then
+    scope_info = " · scope=" .. M.session.focus_kind
+  else
+    scope_info = ""
+  end
+  if M.session.base_branch_name then
+    scope_info = scope_info .. " (vs " .. M.session.base_branch_name .. ")"
+  end
   vim.notify(string.format(
-    "crit-vim: %d file(s) — :CritFiles to list · gt/gT to navigate · :CritFinish to submit",
-    #M.session.files), vim.log.levels.INFO)
+    "crit-vim: %d file(s) · round %d%s — :CritFinish to submit",
+    #M.session.files, M.session.review_round or 1, scope_info),
+    vim.log.levels.INFO)
   return true
+end
+
+-- Switch the review's scope by re-querying /api/session?scope=<name>
+-- and rebuilding tabs. Available scopes: see M.session.available_scopes
+-- (typically some of "unstaged", "staged", "branch", "all").
+function M.set_scope(name)
+  if not M.session then
+    vim.notify("crit-vim: no active review", vim.log.levels.WARN)
+    return
+  end
+  if not name or name == "" then
+    vim.notify(string.format("crit-vim: current scope=%s · available: %s",
+      M.session.scope or M.session.focus_kind or "?",
+      table.concat(M.session.available_scopes or {}, ", ")),
+      vim.log.levels.INFO)
+    return
+  end
+  local base = string.format("http://%s:%d", M.session.host, M.session.port)
+  local url = base .. "/api/session?scope=" .. http.url_encode(name)
+  local out = vim.fn.system({ "curl", "-sS", "--max-time", "5", url })
+  if vim.v.shell_error ~= 0 then
+    vim.notify("crit-vim: set-scope failed: " .. tostring(out),
+      vim.log.levels.ERROR)
+    return
+  end
+  local sess = vim.json.decode(out)
+  local files = sess and sess.files
+  if files == nil or files == vim.NIL then files = {} end
+  M.session.scope = name
+  M.session.files = {}
+  for _, sf in ipairs(files) do
+    table.insert(M.session.files, session_file_to_file_info(sf))
+  end
+  vim.notify(string.format("crit-vim: scope=%s (%d file(s))", name,
+    #M.session.files), vim.log.levels.INFO)
+  M.reopen()
+end
+
+-- Legacy entry point kept for backwards-compat. If the caller still passes
+-- a session_dir (old bash CLI), we bail with a friendly error — the CLI
+-- was updated in lockstep.
+function M.start_review(session_dir)
+  vim.notify("crit-vim: legacy start_review invoked; upgrade `crit-vim` CLI "
+    .. "(you're calling the old bash wrapper). Session_dir=" .. tostring(session_dir),
+    vim.log.levels.ERROR)
+  return false
 end
 
 -- Close review tabs without touching real-file buffers. Real-file buffers
@@ -494,20 +808,25 @@ local function teardown_session_ui()
   end
 end
 
-close_session = function(result)
+close_session = function(_result)
   if not M.session then return end
-  local dir = M.session.dir
+  -- Stop the SSE stream first so no late events fire re-renders on a torn-down UI.
+  if M.session.sse and M.session.sse.stop then
+    pcall(M.session.sse.stop)
+  end
   teardown_session_ui()
-  pcall(write_file, dir .. "/result", result)
-  -- Signal the bash reader. Writing to a FIFO with no reader would block;
-  -- the bash side opens the read end before invoking us, so this is safe.
-  pcall(write_file, dir .. "/done", result .. "\n")
   M.session = nil
+end
+
+-- Kill the crit daemon for this cwd+branch. Called from :CritCancel; the CLI
+-- notices the session file disappear and exits.
+local function stop_crit_daemon()
+  vim.fn.jobstart({ "crit", "stop" }, { detach = true })
 end
 
 local function count_comments(session)
   if not session then return 0 end
-  local data = read_json(session.dir .. "/comments.json")
+  local data = read_review_file()
   if not data or not data.files then return 0 end
   local n = 0
   for _, f in pairs(data.files) do
@@ -543,6 +862,23 @@ local function save_dirty_review_files()
   return saved, failed
 end
 
+-- Sentinel that :CritCancel writes and :CritFinish clears. Our bash CLI
+-- checks it after the daemon exits to know whether to pipe comments back
+-- to the agent (finish) or suppress them (cancel).
+local function cancel_sentinel_path() return vim.fn.expand("~/.crit-vim/last-cancel") end
+
+local function clear_cancel_sentinel()
+  pcall(os.remove, cancel_sentinel_path())
+end
+
+local function write_cancel_sentinel(session_key)
+  pcall(function()
+    vim.fn.mkdir(vim.fn.expand("~/.crit-vim"), "p")
+    local f = io.open(cancel_sentinel_path(), "w")
+    if f then f:write(session_key or ""); f:close() end
+  end)
+end
+
 function M.finish()
   if not M.session then
     vim.notify("crit-vim: no active review", vim.log.levels.WARN)
@@ -556,12 +892,23 @@ function M.finish()
     return
   end
   local n = count_comments(M.session)
-  close_session("ok")
+
+  -- Clear any stale cancel sentinel from a previous run.
+  clear_cancel_sentinel()
+
+  -- Fire /api/finish (best effort) and stop the daemon so the blocked
+  -- `crit --no-open` CLI exits. Do UI teardown + notification synchronously
+  -- so the user sees confirmation immediately (not after HTTP round-trips).
+  local base = string.format("http://%s:%d", M.session.host, M.session.port)
+  http.post(base, "/api/finish", {}, function(_ok, _data, _status) end)
+  stop_crit_daemon()
+
   local extra = saved > 0
     and string.format(" · saved %d edited file%s", saved, saved == 1 and "" or "s")
     or ""
   vim.notify(string.format("crit-vim: submitted review (%d comment%s)%s",
     n, n == 1 and "" or "s", extra), vim.log.levels.INFO)
+  close_session("ok")
 end
 
 function M.cancel()
@@ -578,13 +925,17 @@ function M.cancel()
         vim.log.levels.INFO)
       return
     end
-    -- Discard unsaved changes by reverting the buffers.
     for _, e in ipairs(dirty) do
       pcall(vim.api.nvim_buf_call, e.buf, function() vim.cmd("silent edit!") end)
     end
   end
+  -- Sentinel BEFORE stopping the daemon — the CLI's poll loop may exit as
+  -- soon as the daemon does, and it needs the sentinel to be present then.
+  write_cancel_sentinel(M.session.session_key)
+  stop_crit_daemon()
   close_session("cancel")
-  vim.notify("crit-vim: review cancelled", vim.log.levels.WARN)
+  vim.notify("crit-vim: review cancelled — comments withheld from agent",
+    vim.log.levels.WARN)
 end
 
 -- ---------- comment authoring ----------
@@ -640,10 +991,8 @@ local function open_comment_buffer(ctx)
   -- Plain text — no embedded-language detection (markdown was lighting up
   -- as HTML for some users).
   vim.bo[buf].filetype = "text"
-  vim.api.nvim_buf_set_name(
-    buf,
-    string.format("critvim://%s/%d-%d", ctx.file, ctx.start_line, ctx.end_line)
-  )
+  safe_set_buf_name(buf,
+    string.format("critvim://%s/%d-%d", ctx.file, ctx.start_line, ctx.end_line))
 
   local width = math.min(80, math.max(40, math.floor(vim.o.columns * 0.6)))
   local height = math.max(6, math.floor(vim.o.lines * 0.25))
@@ -746,32 +1095,41 @@ function M._save_comment_buffer(buf)
     vim.notify("crit-vim: empty comment — press q to cancel", vim.log.levels.WARN)
     return
   end
-  local comment = {
-    id = uuid(),
-    start_line = ctx.start_line,
-    end_line = ctx.end_line,
-    side = ctx.side,
-    scope = "line",
-    body = body,
-    resolved = false,
-    resolved_round = 0,
-    replies = {},
-    created_at = iso8601_now(),
-    author = git_author(),
-    quote = ctx.quote,
-    anchor = ctx.anchor,
-  }
-  if ctx.edit_id then
-    comment.id = ctx.edit_id
-    M._replace_comment(ctx.file, ctx.edit_id, comment)
+
+  local function refresh_after()
+    if vim.g.crit_vim_debug then
+      vim.notify("[crit-vim.debug] refresh_after fired for " .. tostring(ctx.file),
+        vim.log.levels.INFO)
+    end
+    M._refresh_signs_for_file(ctx.file)
+    M.render_sidebar()
+    -- Safety net: re-render 250ms later in case the first pass raced the
+    -- daemon's write. Cheap (2 HTTP GETs on localhost).
+    vim.defer_fn(function()
+      if M.session then
+        M._refresh_signs_for_file(ctx.file)
+        M.render_sidebar()
+      end
+    end, 250)
+  end
+
+  if ctx.reply_to then
+    M._api_add_reply(ctx.file, ctx.reply_to, body, function(ok)
+      if ok then refresh_after() end
+    end)
+  elseif ctx.edit_reply_id then
+    M._api_update_reply(ctx.file, ctx.edit_comment_id, ctx.edit_reply_id, body,
+      function(ok) if ok then refresh_after() end end)
+  elseif ctx.edit_id then
+    M._api_update_comment(ctx.file, ctx.edit_id, body, function(ok)
+      if ok then refresh_after() end
+    end)
   else
-    M._append_comment(ctx.file, comment)
+    M._api_add_comment(ctx.file, ctx.side, ctx.start_line, ctx.end_line,
+      body, ctx.quote, function(ok) if ok then refresh_after() end end)
   end
   M._comment_ctx[buf] = nil
   pcall(function() vim.bo[buf].modified = false end)
-  -- Defer cleanup so we're not mutating window/buffer state inside a
-  -- BufWriteCmd autocmd. stopinsert ensures the diff buffer we return to
-  -- doesn't get keystrokes as insert-mode input.
   vim.schedule(function()
     vim.cmd("stopinsert")
     if ctx.win and vim.api.nvim_win_is_valid(ctx.win) then
@@ -781,11 +1139,11 @@ function M._save_comment_buffer(buf)
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
   end)
-  M._refresh_signs_for_file(ctx.file)
-  M.render_sidebar()
+  local kind = ctx.reply_to and "reply"
+    or ctx.edit_reply_id and "reply updated"
+    or (ctx.edit_id and "updated" or "saved")
   vim.notify(string.format("crit-vim: comment %s (%s:%d)",
-    ctx.edit_id and "updated" or "saved", ctx.file, ctx.start_line),
-    vim.log.levels.INFO)
+    kind, ctx.file, ctx.start_line), vim.log.levels.INFO)
 end
 
 function M._cancel_comment_buffer(buf)
@@ -800,14 +1158,6 @@ function M._cancel_comment_buffer(buf)
   end
 end
 
-local function load_comments()
-  local path = M.session.dir .. "/comments.json"
-  local data = read_json(path) or { files = {}, review_comments = {} }
-  if type(data.files) ~= "table" then data.files = {} end
-  if type(data.review_comments) ~= "table" then data.review_comments = {} end
-  return data, path
-end
-
 local function file_status_for(file)
   for _, fi in ipairs(M.session.files) do
     if fi.path == file then return fi.status end
@@ -815,40 +1165,150 @@ local function file_status_for(file)
   return "modified"
 end
 
+-- ---------- HTTP-based comment CRUD ----------
+
+local function api_base_url()
+  if not M.session then return nil end
+  return string.format("http://%s:%d", M.session.host, M.session.port)
+end
+
+local function encode_path(p) return http.url_encode(p) end
+
+-- Post a new line-anchored comment. `on_done(ok, comment)` fires after the
+-- HTTP round-trip and after the re-render/notify. The server owns id,
+-- created_at, and updated_at.
+function M._api_add_comment(file, side, start_line, end_line, body, quote, on_done)
+  local base = api_base_url()
+  if not base then return end
+  http.post(base, "/api/file/comments?path=" .. encode_path(file), {
+    start_line = start_line,
+    end_line   = end_line,
+    side       = side,
+    body       = body,
+    quote      = quote,
+    author     = git_author(),
+    scope      = "line",
+  }, function(ok, data, status)
+    if not ok then
+      vim.notify("crit-vim: add-comment failed (" .. tostring(status) .. "): "
+        .. vim.inspect(data), vim.log.levels.ERROR)
+    end
+    if on_done then on_done(ok, data) end
+  end)
+end
+
+function M._api_update_comment(file, id, body, on_done)
+  local base = api_base_url()
+  if not base then return end
+  http.put(base, "/api/comment/" .. id .. "?path=" .. encode_path(file),
+    { body = body }, function(ok, data, status)
+      if not ok then
+        vim.notify("crit-vim: update-comment failed (" .. tostring(status) .. "): "
+          .. vim.inspect(data), vim.log.levels.ERROR)
+      end
+      if on_done then on_done(ok, data) end
+    end)
+end
+
+function M._api_delete_comment(file, id, on_done)
+  local base = api_base_url()
+  if not base then return end
+  http.delete(base, "/api/comment/" .. id .. "?path=" .. encode_path(file),
+    function(ok, data, status)
+      if not ok then
+        vim.notify("crit-vim: delete failed (" .. tostring(status) .. "): "
+          .. vim.inspect(data), vim.log.levels.ERROR)
+      end
+      if on_done then on_done(ok, data) end
+    end)
+end
+
+function M._api_add_reply(file, id, body, on_done)
+  local base = api_base_url()
+  if not base then return end
+  http.post(base, "/api/comment/" .. id .. "/replies?path=" .. encode_path(file),
+    { body = body, author = git_author() }, function(ok, data, status)
+      if not ok then
+        vim.notify("crit-vim: reply failed (" .. tostring(status) .. "): "
+          .. vim.inspect(data), vim.log.levels.ERROR)
+      end
+      if on_done then on_done(ok, data) end
+    end)
+end
+
+function M._api_update_reply(file, comment_id, reply_id, body, on_done)
+  local base = api_base_url()
+  if not base then return end
+  http.put(base, string.format("/api/comment/%s/replies/%s?path=%s",
+      comment_id, reply_id, encode_path(file)),
+    { body = body }, function(ok, data, status)
+      if not ok then
+        vim.notify("crit-vim: update-reply failed (" .. tostring(status) .. "): "
+          .. vim.inspect(data), vim.log.levels.ERROR)
+      end
+      if on_done then on_done(ok, data) end
+    end)
+end
+
+function M._api_delete_reply(file, comment_id, reply_id, on_done)
+  local base = api_base_url()
+  if not base then return end
+  http.delete(base, string.format("/api/comment/%s/replies/%s?path=%s",
+      comment_id, reply_id, encode_path(file)),
+    function(ok, data, status)
+      if not ok then
+        vim.notify("crit-vim: delete-reply failed (" .. tostring(status) .. "): "
+          .. vim.inspect(data), vim.log.levels.ERROR)
+      end
+      if on_done then on_done(ok, data) end
+    end)
+end
+
+function M._api_set_resolved(file, id, resolved, on_done)
+  local base = api_base_url()
+  if not base then return end
+  http.put(base, "/api/comment/" .. id .. "/resolve?path=" .. encode_path(file),
+    { resolved = resolved }, function(ok, data, status)
+      if not ok then
+        vim.notify("crit-vim: resolve failed (" .. tostring(status) .. "): "
+          .. vim.inspect(data), vim.log.levels.ERROR)
+      end
+      if on_done then on_done(ok, data) end
+    end)
+end
+
+-- Convenience wrappers used by legacy code paths in this file. They fire
+-- HTTP under the hood and re-render on success. Callers used to rely on
+-- synchronous file writes; with HTTP + SSE we optimistically update after
+-- the server confirms.
 function M._append_comment(file, comment)
-  local data, path = load_comments()
-  if not data.files[file] then
-    data.files[file] = { status = file_status_for(file), comments = {} }
-  end
-  table.insert(data.files[file].comments, comment)
-  write_json(path, data)
+  M._api_add_comment(file, comment.side, comment.start_line, comment.end_line,
+    comment.body, comment.quote, function(ok)
+      if ok then
+        M._refresh_signs_for_file(file)
+        M.render_sidebar()
+      end
+    end)
 end
 
 function M._replace_comment(file, id, new_comment)
-  local data, path = load_comments()
-  local fdata = data.files[file]
-  if not fdata then return end
-  for i, c in ipairs(fdata.comments or {}) do
-    if c.id == id then
-      fdata.comments[i] = new_comment
-      write_json(path, data)
-      return
+  M._api_update_comment(file, id, new_comment.body, function(ok)
+    if ok then
+      M._refresh_signs_for_file(file)
+      M.render_sidebar()
     end
-  end
+  end)
 end
 
 function M._delete_comment(file, id)
-  local data, path = load_comments()
-  local fdata = data.files[file]
-  if not fdata then return false end
-  for i, c in ipairs(fdata.comments or {}) do
-    if c.id == id then
-      table.remove(fdata.comments, i)
-      write_json(path, data)
-      return true
+  M._api_delete_comment(file, id, function(ok)
+    if ok then
+      M._refresh_signs_for_file(file)
+      M.render_sidebar()
     end
-  end
-  return false
+  end)
+  -- Legacy contract returns bool synchronously; assume the request was fired.
+  return true
 end
 
 local function comment_at_cursor()
@@ -858,13 +1318,20 @@ local function comment_at_cursor()
   local file = vim.b[bufnr].crit_vim_file
   if not side or not file then return nil end
   local line = vim.api.nvim_win_get_cursor(0)[1]
-  local data = load_comments()
-  local fdata = data.files[file]
-  if not fdata then return nil end
+  -- Fetch live from the daemon; falls back to the review file on error.
+  local comments = api_get_file_comments(file)
+  if not comments then
+    local data = load_comments()
+    local fdata = data.files[file]
+    if not fdata then return nil end
+    comments = fdata.comments or {}
+  end
   -- Pick the last (most recent) comment whose anchor covers the cursor line.
   local match
-  for _, c in ipairs(fdata.comments or {}) do
-    if c.side == side and (c.start_line or 0) <= line and (c.end_line or 0) >= line then
+  for _, c in ipairs(comments) do
+    if norm_side(c.side) == side
+       and (c.start_line or 0) <= line
+       and (c.end_line or 0) >= line then
       match = c
     end
   end
@@ -910,6 +1377,126 @@ function M.delete_at_cursor()
   end
 end
 
+-- ---------- replies + resolve ----------
+
+-- Open a floating buffer to compose a reply to the comment under cursor.
+function M.reply_at_cursor()
+  local c, file = comment_at_cursor()
+  if not c then
+    vim.notify("crit-vim: no comment under cursor", vim.log.levels.WARN)
+    return
+  end
+  open_comment_buffer({
+    file = file,
+    side = c.side,
+    start_line = c.start_line,
+    end_line = c.end_line,
+    quote = c.quote,
+    anchor = c.anchor,
+    reply_to = c.id,
+  })
+end
+
+-- Set the comment under the cursor to `desired` (true = resolved, false =
+-- unresolved). `nil` toggles. No-op if already in the requested state.
+function M.set_resolved_at_cursor(desired)
+  local c, file = comment_at_cursor()
+  if not c then
+    vim.notify("crit-vim: no comment under cursor", vim.log.levels.WARN)
+    return
+  end
+  if desired == nil then desired = not c.resolved end
+  if desired == (not not c.resolved) then
+    vim.notify(string.format("crit-vim: comment already %s",
+      desired and "resolved" or "unresolved"), vim.log.levels.INFO)
+    return
+  end
+  M._api_set_resolved(file, c.id, desired, function(ok)
+    if ok then
+      M._refresh_signs_for_file(file)
+      M.render_sidebar()
+      vim.notify(string.format("crit-vim: comment %s",
+        desired and "resolved" or "unresolved"), vim.log.levels.INFO)
+    end
+  end)
+end
+
+-- Backwards-compat: <Plug>(CritResolve) and older docs treated resolve as a toggle.
+function M.toggle_resolved_at_cursor() M.set_resolved_at_cursor(nil) end
+function M.resolve_at_cursor()         M.set_resolved_at_cursor(true) end
+function M.unresolve_at_cursor()       M.set_resolved_at_cursor(false) end
+
+function M.toggle_show_resolved()
+  if not M.session then return end
+  M.session.show_resolved = not M.session.show_resolved
+  M.render_all_comments()
+  M.render_sidebar()
+  vim.notify("crit-vim: resolved comments now "
+    .. (M.session.show_resolved and "shown" or "hidden"), vim.log.levels.INFO)
+end
+
+-- Pick one of the comment's replies with vim.ui.select and call `cb(reply)`.
+-- Silent no-op if the comment has no replies.
+local function pick_reply(c, prompt, cb)
+  local replies = c.replies or {}
+  if #replies == 0 then
+    vim.notify("crit-vim: this comment has no replies", vim.log.levels.WARN)
+    return
+  end
+  local items = {}
+  for i, r in ipairs(replies) do
+    local preview = (r.body or ""):gsub("\r?\n.*$", "")
+    if #preview > 60 then preview = preview:sub(1, 57) .. "..." end
+    items[i] = string.format("%d. @%s — %s", i, r.author or "?", preview)
+  end
+  vim.ui.select(items, { prompt = prompt }, function(_, idx)
+    if idx and replies[idx] then cb(replies[idx]) end
+  end)
+end
+
+function M.edit_reply_at_cursor()
+  local c, file = comment_at_cursor()
+  if not c then
+    vim.notify("crit-vim: no comment under cursor", vim.log.levels.WARN)
+    return
+  end
+  pick_reply(c, "Edit which reply?", function(reply)
+    open_comment_buffer({
+      file = file,
+      side = c.side,
+      start_line = c.start_line,
+      end_line = c.end_line,
+      quote = c.quote,
+      anchor = c.anchor,
+      edit_reply_id = reply.id,
+      edit_comment_id = c.id,
+      edit_body = reply.body,
+    })
+  end)
+end
+
+function M.delete_reply_at_cursor()
+  local c, file = comment_at_cursor()
+  if not c then
+    vim.notify("crit-vim: no comment under cursor", vim.log.levels.WARN)
+    return
+  end
+  pick_reply(c, "Delete which reply?", function(reply)
+    local preview = (reply.body or ""):gsub("\r?\n.*$", "")
+    if #preview > 50 then preview = preview:sub(1, 47) .. "..." end
+    local resp = vim.fn.input(string.format("delete reply \"%s\"? (y/N) ", preview))
+    if (resp or ""):lower() ~= "y" then return end
+    M._api_delete_reply(file, c.id, reply.id, function(ok)
+      if ok then
+        M._refresh_signs_for_file(file)
+        M.render_sidebar()
+        vim.notify("crit-vim: reply deleted", vim.log.levels.INFO)
+      end
+    end)
+  end)
+end
+
+
 function M.reopen()
   if not M.session then
     vim.notify("crit-vim: no active review", vim.log.levels.WARN)
@@ -919,11 +1506,24 @@ function M.reopen()
   -- may hold the user's unsaved edits — we don't want to lose those).
   teardown_session_ui()
   M.session.file_bufs = {}
+  M.session.first_tab = nil
+  local total = #M.session.files
   for i, file_info in ipairs(M.session.files) do
-    local bufs = open_file_diff(file_info, M.session.base, M.session.repo)
-    M.session.file_bufs[file_info.path] = bufs
-    if i == 1 then M.session.first_tab = bufs.tab end
-    open_sidebar_in_current_tab()
+    if total > 10 and (i == 1 or i % 5 == 0 or i == total) then
+      log(string.format("crit-vim: reopening %d/%d (%s)",
+        i, total, file_info.path), vim.log.levels.INFO)
+      vim.cmd("redraw")
+    end
+    local ok_open, bufs = pcall(open_file_diff, file_info,
+      M.session.base, M.session.repo)
+    if not ok_open then
+      log(string.format("crit-vim: failed to reopen %s: %s",
+        file_info.path, tostring(bufs)), vim.log.levels.WARN)
+    else
+      M.session.file_bufs[file_info.path] = bufs
+      if not M.session.first_tab then M.session.first_tab = bufs.tab end
+      open_sidebar_in_current_tab()
+    end
   end
   if M.session.first_tab then
     pcall(vim.api.nvim_set_current_tabpage, M.session.first_tab)
@@ -971,7 +1571,12 @@ end
 
 function M._refresh_signs_for_file(file)
   local bufs = M.session and M.session.file_bufs[file]
-  if not bufs then return end
+  if not bufs then
+    if vim.g.crit_vim_debug then
+      vim.notify("[crit-vim.debug] refresh: no bufs for " .. tostring(file), vim.log.levels.WARN)
+    end
+    return
+  end
 
   -- For added/deleted files left==right; dedupe so we don't clear twice.
   local seen = {}
@@ -982,93 +1587,192 @@ function M._refresh_signs_for_file(file)
     end
   end
 
-  local data = read_json(M.session.dir .. "/comments.json")
-  if not data or not data.files or not data.files[file] then return end
+  -- Prefer the live HTTP source (no debounce staleness). Fall back to
+  -- reading the review file if the daemon is unreachable.
+  local comments = api_get_file_comments(file)
+  if not comments then
+    local data = read_review_file()
+    if not data or not data.files or not data.files[file] then return end
+    comments = data.files[file].comments or {}
+  end
+  if vim.g.crit_vim_debug then
+    vim.notify(string.format("[crit-vim.debug] refresh %s: %d comment(s)",
+      file, #comments), vim.log.levels.INFO)
+  end
 
-  for _, c in ipairs(data.files[file].comments or {}) do
-    local buf = c.side == "left" and bufs.left or bufs.right
-    if vim.api.nvim_buf_is_valid(buf) then
+  local show_resolved = (M.session and M.session.show_resolved ~= false)
+  for _, c in ipairs(comments) do
+    -- Isolate per-comment failures so one bad comment doesn't skip the rest.
+    local ok, err = pcall(function()
+    if c.resolved and not show_resolved then
+      -- Skip rendering entirely when the user has toggled resolved off.
+      return
+    end
+    local buf = norm_side(c.side) == "left" and bufs.left or bufs.right
+    if vim.api.nvim_buf_is_valid(buf)
+       and vim.api.nvim_buf_line_count(buf) > 0 then
       local line_count = vim.api.nvim_buf_line_count(buf)
       local start_l = math.max((c.start_line or 1) - 1, 0)
       local end_l   = math.min((c.end_line or c.start_line or 1) - 1, line_count - 1)
+      -- Skip if the comment's anchor is entirely out of the buffer (e.g.,
+      -- comment was left on a line that no longer exists after an edit, or
+      -- on the deleted-side of a scoped diff where the file has no left
+      -- content). Rendering it would either hit E5555 (extmark past EOB)
+      -- or land on the wrong line.
+      if start_l >= line_count then return end
       if end_l < start_l then end_l = start_l end
 
       -- Bar in the sign column + range background on every line of the
       -- comment span. One extmark per line so it survives partial edits.
+      -- Resolved threads get a dimmed bar and no range background — they
+      -- collapse visually into the diff.
       for l = start_l, end_l do
         vim.api.nvim_buf_set_extmark(buf, M._ns, l, 0, {
           sign_text = "▎",
-          sign_hl_group = "CritVimCommentBar",
-          line_hl_group = "CritVimCommentRange",
+          sign_hl_group = c.resolved and "CritVimCommentResolvedBar"
+                                     or "CritVimCommentBar",
+          line_hl_group = c.resolved and nil or "CritVimCommentRange",
           priority = 50,
         })
       end
 
       -- Bordered comment box rendered as virt_lines below the range.
-      -- Padded to a consistent inner width so the box background reads
-      -- as one solid contrasting card. Long lines are word-wrapped at
-      -- `target_width` cells so nothing overflows the box.
-      local body = c.body or ""
-      local body_lines = vim.split(body, "\r?\n")
-      local resolved_marker = c.resolved and "  ✓" or ""
-      local author_line = "@" .. (c.author or "?") .. resolved_marker
-
+      -- Body word-wrapped at `target_width`. Reply threads render inside
+      -- the same box, separated by a divider row. Resolved threads
+      -- collapse to a single dimmed one-liner: no divider, no replies,
+      -- just a preview.
       local target_width = 76
+      local virt
 
-      local wrapped_author = wrap_line(author_line, target_width)
-      local wrapped_body = {}
-      for _, bl in ipairs(body_lines) do
-        local segs = wrap_line(bl, target_width)
-        if #segs == 0 then
-          table.insert(wrapped_body, "")
-        else
-          for _, seg in ipairs(segs) do table.insert(wrapped_body, seg) end
+      if c.resolved then
+        -- Folded resolved thread: ✓ @author: body-preview (+N replies).
+        local preview = (c.body or ""):gsub("\r?\n.*$", "")
+        local n_replies = #(c.replies or {})
+        local suffix = n_replies > 0 and string.format(" (+%d)", n_replies) or ""
+        local text = string.format("✓ @%s: %s%s",
+          c.author or "?", preview, suffix)
+        -- Trim once to a compact width (no wrapping — the whole point is
+        -- one line).
+        local max = 88
+        if vim.fn.strdisplaywidth(text) > max then
+          -- Byte-wise cut is fine here — ASCII prefix (✓ is 3 bytes UTF-8
+          -- but at the start, so the cut point is well past it).
+          text = text:sub(1, max - 1) .. "…"
         end
+        local w = vim.fn.strdisplaywidth(text)
+        virt = {
+          { { "╭" .. string.rep("─", w + 2) .. "╮", "CritVimCommentResolvedBorder" } },
+          {
+            { "│ ", "CritVimCommentResolvedBorder" },
+            { text, "CritVimCommentResolved" },
+            { " │", "CritVimCommentResolvedBorder" },
+          },
+          { { "╰" .. string.rep("─", w + 2) .. "╯", "CritVimCommentResolvedBorder" } },
+        }
+      else
+        local body_hl = "CritVimCommentBody"
+        local author_line = "@" .. (c.author or "?")
+
+        -- Sections = {section, section, ...} where each section is a list of
+        -- {text, hl} rows. Sections are joined with a divider row between them.
+        local sections = {}
+
+        local function wrap_body_into(rows, body, hl)
+          for _, bl in ipairs(vim.split(body or "", "\r?\n")) do
+            local segs = wrap_line(bl, target_width)
+            if #segs == 0 then
+              table.insert(rows, { "", hl })
+            else
+              for _, seg in ipairs(segs) do table.insert(rows, { seg, hl }) end
+            end
+          end
+        end
+
+        -- Root section (the comment itself).
+        local root_rows = {}
+        for _, seg in ipairs(wrap_line(author_line, target_width)) do
+          table.insert(root_rows, { seg, "CritVimCommentBody" })
+        end
+        table.insert(root_rows, { "", body_hl })  -- spacer under header
+        wrap_body_into(root_rows, c.body, body_hl)
+        table.insert(sections, root_rows)
+
+        -- Reply sections.
+        for _, r in ipairs(c.replies or {}) do
+          local reply_rows = {}
+          local prefix = "↳ @" .. (r.author or "?")
+          for _, seg in ipairs(wrap_line(prefix, target_width)) do
+            table.insert(reply_rows, { seg, "CritVimCommentReplyAuthor" })
+          end
+          table.insert(reply_rows, { "", "CritVimCommentReply" })
+          wrap_body_into(reply_rows, r.body, "CritVimCommentReply")
+          table.insert(sections, reply_rows)
+        end
+
+        -- Compute the box's inner width from the widest rendered row.
+        local inner_width = 20
+        for _, sec in ipairs(sections) do
+          for _, row in ipairs(sec) do
+            inner_width = math.max(inner_width, vim.fn.strdisplaywidth(row[1]))
+          end
+        end
+        if inner_width > target_width then inner_width = target_width end
+
+        local border_top    = "╭" .. string.rep("─", inner_width + 2) .. "╮"
+        local border_bottom = "╰" .. string.rep("─", inner_width + 2) .. "╯"
+        local divider       = "├" .. string.rep("┈", inner_width + 2) .. "┤"
+
+        virt = { { { border_top, "CritVimCommentBorder" } } }
+
+        local function push_row(text, hl)
+          local pad = inner_width - vim.fn.strdisplaywidth(text)
+          if pad < 0 then pad = 0 end
+          table.insert(virt, {
+            { "│ ",                        "CritVimCommentBorder" },
+            { text,                        hl },
+            { string.rep(" ", pad) .. " ", hl },
+            { "│",                         "CritVimCommentBorder" },
+          })
+        end
+
+        for i, sec in ipairs(sections) do
+          if i > 1 then
+            table.insert(virt, { { divider, "CritVimCommentDivider" } })
+          end
+          for _, row in ipairs(sec) do push_row(row[1], row[2]) end
+        end
+
+        table.insert(virt, { { border_bottom, "CritVimCommentBorder" } })
       end
 
-      local inner_width = 20  -- min
-      for _, s in ipairs(wrapped_author) do
-        inner_width = math.max(inner_width, vim.fn.strdisplaywidth(s))
-      end
-      for _, s in ipairs(wrapped_body) do
-        inner_width = math.max(inner_width, vim.fn.strdisplaywidth(s))
-      end
-      if inner_width > target_width then inner_width = target_width end
-
-      local border_top    = "╭" .. string.rep("─", inner_width + 2) .. "╮"
-      local border_bottom = "╰" .. string.rep("─", inner_width + 2) .. "╯"
-
-      local virt = { { { border_top, "CritVimCommentBorder" } } }
-
-      local function push_row(text)
-        local pad = inner_width - vim.fn.strdisplaywidth(text)
-        if pad < 0 then pad = 0 end
-        table.insert(virt, {
-          { "│ ",                        "CritVimCommentBorder" },
-          { text,                        "CritVimCommentBody" },
-          { string.rep(" ", pad) .. " ", "CritVimCommentBody" },
-          { "│",                         "CritVimCommentBorder" },
-        })
-      end
-
-      for _, s in ipairs(wrapped_author) do push_row(s) end
-      if #wrapped_body > 0 then push_row("") end   -- spacer under header
-      for _, s in ipairs(wrapped_body) do push_row(s) end
-
-      table.insert(virt, { { border_bottom, "CritVimCommentBorder" } })
-
-      vim.api.nvim_buf_set_extmark(buf, M._ns, end_l, 0, {
+      -- Nvim clips virt_lines rendered below the last buffer line. Flip
+      -- the anchor to above `start_l` when the comment sits on the last
+      -- line so the box stays visible.
+      local at_last_line = (end_l == line_count - 1)
+      local anchor_row   = at_last_line and start_l or end_l
+      vim.api.nvim_buf_set_extmark(buf, M._ns, anchor_row, 0, {
         virt_lines = virt,
-        virt_lines_above = false,
+        virt_lines_above = at_last_line,
         priority = 50,
       })
+    end
+    end)  -- pcall wrapper
+    if not ok then
+      log(string.format("render comment %s failed: %s",
+        tostring(c.id or "?"), tostring(err)),
+        vim.log.levels.WARN, { silent = true })
     end
   end
 end
 
 function M.render_all_comments()
   if not M.session then return end
-  local data = read_json(M.session.dir .. "/comments.json") or { files = {} }
+  local data = read_review_file()
+  -- Render every session file (some files may have no comments yet).
+  for _, fi in ipairs(M.session.files or {}) do
+    M._refresh_signs_for_file(fi.path)
+  end
+  -- Then anything else that has comments but isn't tracked (defensive).
   for file, _ in pairs(data.files or {}) do
     M._refresh_signs_for_file(file)
   end
@@ -1079,7 +1783,7 @@ function M.list()
     vim.notify("crit-vim: no active review", vim.log.levels.WARN)
     return
   end
-  local data = read_json(M.session.dir .. "/comments.json") or { files = {} }
+  local data = read_review_file()
   local items = {}
   for file, fdata in pairs(data.files or {}) do
     for _, c in ipairs(fdata.comments or {}) do
@@ -1099,6 +1803,192 @@ function M.list()
   vim.cmd("copen")
 end
 
+-- Locate the plugin's VERSION file by walking up from this init.lua.
+local function plugin_version()
+  local source = debug.getinfo(1, "S").source
+  if source:sub(1, 1) == "@" then source = source:sub(2) end
+  local plugin_dir = source:match("^(.*)/lua/crit%-vim/init%.lua$")
+  if not plugin_dir then return "(unknown)" end
+  local f = io.open(plugin_dir .. "/VERSION", "r")
+  if not f then return "(unknown)" end
+  local v = (f:read("*a") or ""):gsub("%s+", "")
+  f:close()
+  return v ~= "" and v or "(unknown)"
+end
+
+-- Open the crit-vim debug log in a scratch buffer for inspection. Handy for
+-- debugging remote-machine issues: users can `:CritLog` and paste the tail.
+function M.show_log()
+  local path = log_path()
+  if vim.fn.filereadable(path) == 0 then
+    vim.notify("crit-vim: no log yet at " .. path, vim.log.levels.INFO)
+    return
+  end
+  vim.cmd("tabnew " .. vim.fn.fnameescape(path))
+  vim.bo.buftype = ""
+  vim.notify("crit-vim: log at " .. path, vim.log.levels.INFO)
+end
+
+-- Print the log file path (for scripts / `:!cat $(...)` piping).
+function M.log_path() return log_path() end
+
+-- Print crit-vim plugin version + crit CLI version + (if a review is active)
+-- session summary + daemon health.
+function M.version()
+  local lines = { "crit-vim plugin: " .. plugin_version() }
+  -- Disk VERSION can disagree with the loaded module. 
+  -- Report the real runtime capability.
+  if type(M.start_review_v2) ~= "function" then
+    table.insert(lines, "  ⚠ loaded module is STALE — :Lazy reload crit-vim (or restart nvim)")
+  end
+
+  local cli = vim.fn.systemlist({ "crit", "--version" })
+  if vim.v.shell_error == 0 and cli[1] then
+    table.insert(lines, "crit CLI:        " .. cli[1])
+  else
+    table.insert(lines, "crit CLI:        (not on $PATH)")
+  end
+
+  if M.session then
+    local base = string.format("http://%s:%d", M.session.host, M.session.port)
+    table.insert(lines, "")
+    table.insert(lines, string.format("session:         port=%d key=%s",
+      M.session.port, M.session.session_key or "?"))
+    table.insert(lines, string.format("branch/base:     %s → %s",
+      M.session.branch or "?", M.session.base or "?"))
+    table.insert(lines, string.format("round:           %d",
+      M.session.review_round or 1))
+    table.insert(lines, string.format("files:           %d", #(M.session.files or {})))
+    local health = vim.fn.system({ "curl", "-sS", "--max-time", "2", base .. "/api/health" })
+    if vim.v.shell_error == 0 then
+      table.insert(lines, "daemon health:   " .. (health or ""):gsub("%s+$", ""))
+    else
+      table.insert(lines, "daemon health:   (unreachable)")
+    end
+  else
+    table.insert(lines, "")
+    table.insert(lines, "session:         (no active review)")
+  end
+
+  vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
+end
+
+-- Register user commands, autocmds, and <Plug> mappings.
+-- Called from plugin/crit-vim.lua at startup AND re-runs on `:Lazy reload`
+-- because it lives here in lua/ (plugin/ is startup-only).
+function M._register()
+  local group = vim.api.nvim_create_augroup("crit-vim", { clear = true })
+
+  vim.api.nvim_create_autocmd("VimEnter",
+    { group = group, callback = function() M.register_socket() end })
+  vim.api.nvim_create_autocmd("VimLeavePre",
+    { group = group, callback = function() M.unregister_socket() end })
+  vim.api.nvim_create_autocmd("DirChanged",
+    { group = group, callback = function() M.register_socket() end })
+  vim.api.nvim_create_autocmd("TabEnter",
+    { group = group, callback = function() M._reposition_sidebar_cursor() end })
+
+  -- Some ftplugins / other plugins toggle number/signcolumn on
+  -- BufWinEnter after we set them. Re-apply on every WinEnter into a
+  -- review buffer so the gutter stays populated.
+  vim.api.nvim_create_autocmd({ "WinEnter", "BufWinEnter" }, {
+    group = group,
+    callback = function(args)
+      if not M.session then return end
+      if not vim.b[args.buf].crit_vim_file then return end
+      local win = vim.api.nvim_get_current_win()
+      pcall(function()
+        vim.wo[win].number         = true
+        vim.wo[win].relativenumber = vim.go.relativenumber
+        vim.wo[win].signcolumn     = "yes"
+      end)
+    end,
+  })
+
+  local function cmd(name, fn, opts)
+    opts = opts or {}
+    -- nvim_create_user_command replaces silently, so this is idempotent
+    -- across reloads.
+    vim.api.nvim_create_user_command(name, fn, opts)
+  end
+
+  cmd("CritComment", function(opts)
+    if not M.session then
+      vim.notify("crit-vim: no active review", vim.log.levels.WARN)
+      return
+    end
+    if opts.range == 2 then
+      M.comment_range({ opts.line1 }, { opts.line2 })
+    else
+      M.comment_line(vim.api.nvim_win_get_cursor(0)[1])
+    end
+  end, { range = true, desc = "crit-vim: comment on line / range" })
+
+  cmd("CritEdit", function() M.edit_at_cursor() end,
+    { desc = "crit-vim: edit comment under cursor" })
+  cmd("CritDelete", function() M.delete_at_cursor() end,
+    { desc = "crit-vim: delete comment under cursor" })
+  cmd("CritReopen", function() M.reopen() end,
+    { desc = "crit-vim: rebuild diff tabs" })
+  cmd("CritSidebar", function() M.sidebar_toggle() end,
+    { desc = "crit-vim: toggle file sidebar" })
+  cmd("CritList", function() M.list() end,
+    { desc = "crit-vim: show comments in quickfix" })
+  cmd("CritFinish", function() M.finish() end,
+    { desc = "crit-vim: submit review" })
+  cmd("CritCancel", function() M.cancel() end,
+    { desc = "crit-vim: cancel review" })
+  cmd("CritReply", function() M.reply_at_cursor() end,
+    { desc = "crit-vim: reply to comment under cursor" })
+  cmd("CritEditReply", function() M.edit_reply_at_cursor() end,
+    { desc = "crit-vim: edit a reply on the comment under cursor" })
+  cmd("CritDeleteReply", function() M.delete_reply_at_cursor() end,
+    { desc = "crit-vim: delete a reply on the comment under cursor" })
+  cmd("CritResolve", function() M.resolve_at_cursor() end,
+    { desc = "crit-vim: mark comment resolved" })
+  cmd("CritUnresolve", function() M.unresolve_at_cursor() end,
+    { desc = "crit-vim: mark comment unresolved" })
+  cmd("CritToggleResolved", function() M.toggle_show_resolved() end,
+    { desc = "crit-vim: show or hide resolved comments" })
+  cmd("CritVersion", function() M.version() end,
+    { desc = "crit-vim: show plugin + CLI + session versions" })
+  cmd("CritLog", function() M.show_log() end,
+    { desc = "crit-vim: open the debug log file in a tab" })
+  cmd("CritScope", function(opts) M.set_scope(opts.args) end,
+    { nargs = "?", desc = "crit-vim: switch review scope (unstaged/staged/branch/all)",
+      complete = function()
+        return (M.session and M.session.available_scopes) or
+               { "unstaged", "staged", "branch", "all" }
+      end })
+
+  -- <Plug> API. See README.
+  function _G.crit_vim_op(_motion_type)
+    local s = vim.api.nvim_buf_get_mark(0, "[")
+    local e = vim.api.nvim_buf_get_mark(0, "]")
+    M.comment_range(s, e)
+  end
+
+  vim.keymap.set("n", "<Plug>(CritComment)", function()
+    vim.o.operatorfunc = "v:lua.crit_vim_op"
+    return "g@"
+  end, { expr = true, desc = "crit-vim: comment on motion" })
+
+  vim.keymap.set("x", "<Plug>(CritComment)", function()
+    vim.o.operatorfunc = "v:lua.crit_vim_op"
+    return "g@"
+  end, { expr = true, desc = "crit-vim: comment on selection" })
+
+  vim.keymap.set("n", "<Plug>(CritCommentLine)", function()
+    M.comment_line(vim.api.nvim_win_get_cursor(0)[1])
+  end, { desc = "crit-vim: comment on current line" })
+
+  vim.keymap.set("n", "<Plug>(CritReply)", function() M.reply_at_cursor() end,
+    { desc = "crit-vim: reply to comment under cursor" })
+
+  vim.keymap.set("n", "<Plug>(CritResolve)", function() M.toggle_resolved_at_cursor() end,
+    { desc = "crit-vim: toggle resolved on comment under cursor" })
+end
+
 -- Optional convenience for users who don't want to write their own `keys`
 -- block. Call with `{ default_keys = true }` to bind <leader>C{,C} to the
 -- <Plug> targets globally.
@@ -1109,6 +1999,10 @@ function M.setup(opts)
       { desc = "Crit: comment (motion / visual)" })
     vim.keymap.set("n", "<leader>CC", "<Plug>(CritCommentLine)",
       { desc = "Crit: comment current line" })
+    vim.keymap.set("n", "<leader>Cr", "<Plug>(CritReply)",
+      { desc = "Crit: reply to comment under cursor" })
+    vim.keymap.set("n", "<leader>Cx", "<Plug>(CritResolve)",
+      { desc = "Crit: toggle resolved" })
   end
 end
 

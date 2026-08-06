@@ -1,33 +1,25 @@
 #!/usr/bin/env bash
-# crit-vim — minimal review CLI
+# crit-vim — nvim-native client for tomasz-tomczyk/crit.
 #
 # Subcommands:
-#   review [--base REF] [--wait|--no-wait] [--timeout SECONDS] [--socket PATH] [--code]
-#       Open a review of `git diff <base>` in the user's running nvim and
-#       (by default) block until :CritFinish or :CritCancel.
-#       On success, prints crit-shape JSON to stdout and exits 0.
-#       Exit codes: 0 ok, 1 cancelled, 2 setup error, 124 timeout.
+#   review [--base REF] [--timeout SECONDS] [--socket PATH] [--no-open-browser]
+#       Ensure a crit daemon is running for cwd+branch (spawning `crit --no-open`
+#       if none is), tell nvim to attach to it, and block until the user finishes
+#       the review (from nvim via :CritFinish, or from a browser tab).
+#       On success, prints `crit comments --json` output and exits 0.
+#       Exit codes: 0 ok, 1 cancelled / no crit binary, 2 setup error, 124 timeout.
 #
-#   status [--code]
-#       Print the JSON of the most recently finished review.
+#   status
+#       Wrapper around `crit status --json`.
 #
 #   doctor
-#       Diagnose nvim socket discovery.
+#       Diagnose nvim socket discovery and crit binary availability.
 
 set -euo pipefail
 
 # ---------- helpers ----------
 
 die() { echo "crit-vim: $*" >&2; exit 2; }
-
-json_str() {
-  # JSON-encode stdin as a string literal (uses jq if available, else python3).
-  if command -v jq >/dev/null 2>&1; then
-    jq -Rs .
-  else
-    python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))'
-  fi
-}
 
 sha256_hex() {
   if command -v shasum >/dev/null 2>&1; then
@@ -38,7 +30,43 @@ sha256_hex() {
 }
 
 repo_root() {
-  git rev-parse --show-toplevel 2>/dev/null || return 1
+  local r
+  r=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  # Canonicalize (resolve symlinks) so the session key matches what `crit`
+  # computes from its own os.Getwd — on macOS /var/folders symlinks to
+  # /private/var/folders and the two hash differently.
+  ( cd "$r" 2>/dev/null && pwd -P ) || printf '%s\n' "$r"
+}
+
+# Session-key formula from tomasz-tomczyk/crit: sha256(cwd + "\0" + branch)[:12].
+# Mirrored here so we can find the session file without spawning `crit status`.
+session_key_for_cwd_branch() {
+  local cwd="$1" branch="$2"
+  printf '%s\0%s' "$cwd" "$branch" | sha256_hex | cut -c1-12
+}
+
+session_file_path() {
+  local key="$1"
+  printf '%s\n' "$HOME/.crit/sessions/$key.json"
+}
+
+# Ask crit where its session lives instead of recomputing the key. crit's own
+# key derivation is internal and has drifted across versions (mirroring it as
+# sha256(cwd\0branch) broke on crit 0.18 — it matches some repos, not others).
+# `crit status --json` reports review_file = <reviews>/<session-id>/review.json,
+# and the daemon writes sessions/<session-id>.json — same id. Works with or
+# without a running daemon. Echoes the session-file path, or returns 1.
+crit_session_file() {
+  local repo="$1" id
+  id=$( cd "$repo" && crit status --json 2>/dev/null | python3 -c '
+import json, os, sys
+try:
+    rf = (json.load(sys.stdin).get("review_file") or "")
+except Exception:
+    sys.exit(1)
+print(os.path.basename(os.path.dirname(rf)) if rf else "")' ) || return 1
+  [[ -n "$id" ]] || return 1
+  printf '%s\n' "$HOME/.crit/sessions/$id.json"
 }
 
 socket_registry_path() {
@@ -48,125 +76,128 @@ socket_registry_path() {
   printf '%s' "$HOME/.crit-vim/sockets/$sha"
 }
 
+# Evaluate a --remote-expr against an nvim server, UI-free. In an interactive
+# terminal a bare `nvim --server … --remote-expr` starts a full TUI: it writes
+# escape codes to stdout and the actual result to stderr, so a caller capturing
+# stdout gets garbage instead of the value. --headless disables the UI and
+# </dev/null keeps nvim from ever thinking it owns the terminal.
+nvim_expr() {
+  nvim --headless --server "$1" --remote-expr "$2" </dev/null 2>/dev/null
+}
+
+# True if the nvim at $1 is reachable AND has crit-vim's start_review_v2 loaded.
+socket_has_v2() {
+  local r
+  r=$(nvim_expr "$1" \
+        "luaeval('(type(require\"crit-vim\".start_review_v2) == \"function\") and 1 or 0')" \
+        || echo 0)
+  [[ "$r" == "1" ]]
+}
+
 find_socket() {
-  # Resolution order: --socket > $CRIT_VIM_SOCKET > $NVIM > per-repo registry.
+  # --socket is an explicit override: trust it verbatim.
   if [[ -n "${FORCE_SOCKET:-}" ]]; then printf '%s\n' "$FORCE_SOCKET"; return 0; fi
-  if [[ -n "${CRIT_VIM_SOCKET:-}" ]]; then printf '%s\n' "$CRIT_VIM_SOCKET"; return 0; fi
-  if [[ -n "${NVIM:-}" ]]; then printf '%s\n' "$NVIM"; return 0; fi
-  local repo
-  repo=$(repo_root) || return 1
-  local reg
-  reg=$(socket_registry_path "$repo")
-  if [[ -f "$reg" ]]; then
-    local s
-    s=$(cat "$reg")
-    if [[ -n "$s" ]]; then
-      printf '%s\n' "$s"
-      return 0
-    fi
+
+  # Candidates in precedence order: $CRIT_VIM_SOCKET > $NVIM > per-repo registry.
+  # A stale $NVIM (e.g. a leftover :terminal whose parent nvim was replaced) is
+  # reachable but has no plugin — it must not shadow a live nvim that does. So
+  # prefer the first candidate exposing start_review_v2; only if none do, fall
+  # back to the first merely-reachable one (so the caller's guard can print its
+  # actionable "reload the plugin" message).
+  local candidates=() repo reg s
+  [[ -n "${CRIT_VIM_SOCKET:-}" ]] && candidates+=("$CRIT_VIM_SOCKET")
+  [[ -n "${NVIM:-}" ]] && candidates+=("$NVIM")
+  if repo=$(repo_root); then
+    reg=$(socket_registry_path "$repo")
+    [[ -f "$reg" ]] && { s=$(cat "$reg"); [[ -n "$s" ]] && candidates+=("$s"); }
   fi
+
+  local first_reachable="" c
+  for c in ${candidates[@]+"${candidates[@]}"}; do
+    nvim_reachable "$c" || continue
+    [[ -z "$first_reachable" ]] && first_reachable="$c"
+    if socket_has_v2 "$c"; then printf '%s\n' "$c"; return 0; fi
+  done
+  [[ -n "$first_reachable" ]] && { printf '%s\n' "$first_reachable"; return 0; }
   return 1
 }
 
 nvim_reachable() {
-  nvim --server "$1" --remote-expr '1' >/dev/null 2>&1
+  nvim --headless --server "$1" --remote-expr '1' </dev/null >/dev/null 2>&1
 }
 
 # ---------- review ----------
 
+CRIT_SPAWNED_PID=""
+
+cleanup_spawned_daemon() {
+  if [[ -n "$CRIT_SPAWNED_PID" ]]; then
+    kill "$CRIT_SPAWNED_PID" 2>/dev/null || true
+    wait "$CRIT_SPAWNED_PID" 2>/dev/null || true
+  fi
+}
+
 cmd_review() {
-  local base="HEAD"
-  local wait_for_finish=1
+  local base=""
+  local scope=""
   local timeout=14400
+  local no_open_browser=1  # default: nvim is the UI, don't pop a browser
   FORCE_SOCKET="${FORCE_SOCKET:-}"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --base) base="$2"; shift 2 ;;
       --base=*) base="${1#*=}"; shift ;;
-      --wait) wait_for_finish=1; shift ;;
-      --no-wait) wait_for_finish=0; shift ;;
+      --scope) scope="$2"; shift 2 ;;
+      --scope=*) scope="${1#*=}"; shift ;;
       --timeout) timeout="$2"; shift 2 ;;
       --timeout=*) timeout="${1#*=}"; shift ;;
       --socket) FORCE_SOCKET="$2"; shift 2 ;;
       --socket=*) FORCE_SOCKET="${1#*=}"; shift ;;
-      --code|--json) shift ;;  # accepted for skill compatibility; always crit-shape
+      --open-browser) no_open_browser=0; shift ;;
+      --no-open-browser) no_open_browser=1; shift ;;
+      --code|--json|--wait|--no-wait) shift ;;  # accepted for skill compat
       -h|--help) cat <<EOF
-usage: crit-vim review [--base REF] [--wait|--no-wait] [--timeout SECS] [--socket PATH]
+usage: crit-vim review [--base REF] [--scope NAME] [--timeout SECS]
+                       [--socket PATH] [--open-browser | --no-open-browser]
+
+  --base REF      Diff against REF. --base HEAD implies --scope unstaged.
+  --scope NAME    Narrow to a subset of the branch diff.
+                  Common values: unstaged, staged, branch, all.
 EOF
         return 0 ;;
       *) die "unknown option: $1" ;;
     esac
   done
 
-  local repo
-  repo=$(repo_root) || die "not in a git repo"
-
-  # Enumerate changed files vs base.
-  local files_json="["
-  local sep=""
-  local any=0
-  while IFS=$'\t' read -r status path new_path; do
-    [[ -z "${status:-}" ]] && continue
-    any=1
-    local first="${status:0:1}"
-    local st
-    case "$first" in
-      A) st="added" ;;
-      D) st="deleted" ;;
-      M) st="modified" ;;
-      R) st="renamed" ;;
-      C) st="copied" ;;
-      T) st="modified" ;;
-      *) st="modified" ;;
-    esac
-    if [[ "$st" == "renamed" || "$st" == "copied" ]]; then
-      local p_enc np_enc op_enc
-      np_enc=$(printf '%s' "$new_path" | json_str)
-      op_enc=$(printf '%s' "$path" | json_str)
-      files_json+="${sep}{\"path\":${np_enc},\"status\":\"${st}\",\"old_path\":${op_enc}}"
-    else
-      local p_enc
-      p_enc=$(printf '%s' "$path" | json_str)
-      files_json+="${sep}{\"path\":${p_enc},\"status\":\"${st}\"}"
-    fi
-    sep=","
-  # Tracked diffs + untracked files (the agent's new files, which would
-  # otherwise be invisible until `git add`). Both streams are name-status
-  # formatted.
-  done < <({ git -C "$repo" diff --name-status "$base"; git -C "$repo" ls-files --others --exclude-standard | awk '{print "A\t" $0}'; })
-  files_json+="]"
-
-  if [[ "$any" -eq 0 ]]; then
-    die "no changes vs $base"
+  # `--base HEAD` = "review my uncommitted work". Without --scope, crit's
+  # default focus is "everything since base-branch", which surprises users
+  # on branches with committed history. Map it explicitly to scope=unstaged.
+  if [[ "$base" == "HEAD" && -z "$scope" ]]; then
+    scope="unstaged"
+    base=""  # don't pass --range HEAD..HEAD (empty diff)
   fi
 
-  # Session directory.
-  local tmp="${TMPDIR:-/tmp}"
-  tmp="${tmp%/}"
-  local sid
-  sid=$(uuidgen | tr '[:upper:]' '[:lower:]')
-  local sdir="$tmp/crit-vim/$sid"
-  mkdir -p "$sdir"
+  # Fresh run: wipe any stale cancel sentinel from a previous session, so
+  # its result doesn't leak into this one.
+  rm -f "$HOME/.crit-vim/last-cancel" 2>/dev/null || true
 
-  # Write meta.json.
-  local repo_enc base_enc sid_enc
-  repo_enc=$(printf '%s' "$repo" | json_str)
-  base_enc=$(printf '%s' "$base" | json_str)
-  sid_enc=$(printf '%s' "$sid" | json_str)
-  printf '{"session_id":%s,"repo_root":%s,"base":%s,"files":%s}\n' \
-    "$sid_enc" "$repo_enc" "$base_enc" "$files_json" > "$sdir/meta.json"
+  command -v crit >/dev/null 2>&1 || {
+    cat >&2 <<'EOM'
+crit-vim: `crit` (tomasz-tomczyk/crit) is not installed.
+  Install with:  brew install crit
+  or:            go install github.com/tomasz-tomczyk/crit/cmd/crit@latest
+  crit-vim uses crit as the review-session backend since 0.2.0.
+EOM
+    exit 2
+  }
 
-  # Initialise empty crit-shape comments file.
-  printf '{"files":{},"review_comments":[]}\n' > "$sdir/comments.json"
+  local repo branch
+  repo=$(repo_root) || die "not in a git repo"
+  branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
 
-  # FIFO that vim signals when the review is done.
-  mkfifo "$sdir/done"
-
-  # Find the user's nvim.
   local sock
   if ! sock=$(find_socket); then
-    rm -rf "$sdir"
     cat >&2 <<EOM
 crit-vim: cannot find a running nvim with the crit-vim plugin loaded.
   Tried: \$NVIM, \$CRIT_VIM_SOCKET, ~/.crit-vim/sockets/<sha(repo)>
@@ -176,95 +207,242 @@ crit-vim: cannot find a running nvim with the crit-vim plugin loaded.
 EOM
     exit 2
   fi
-
   if ! nvim_reachable "$sock"; then
-    rm -rf "$sdir"
     die "nvim socket is unreachable: $sock"
   fi
 
-  # Open the FIFO read-end first so the lua writer doesn't block.
-  exec 3<>"$sdir/done"
+  # Ask crit for its session file; fall back to the legacy mirrored key only if
+  # `crit status` is unavailable. See whether a daemon is already running.
+  local session_file key
+  session_file=$(crit_session_file "$repo") \
+    || session_file=$(session_file_path "$(session_key_for_cwd_branch "$repo" "$branch")")
+  key=$(basename "$session_file" .json)   # crit's real session id (for nvim's session_key)
 
-  # Tell vim to start the review. luaeval's _A is the bash-supplied arg.
-  local sdir_lua_arg
-  sdir_lua_arg=$(printf '%s' "$sdir" | sed "s/'/\\\\'/g")
-  if ! nvim --server "$sock" --remote-expr \
-        "luaeval('require\"crit-vim\".start_review(_A)', '$sdir_lua_arg')" \
-        >/dev/null 2>"$sdir/nvim.err"; then
+  local spawn=1
+  if [[ -f "$session_file" ]]; then
+    # Trust the file; if the daemon is dead, spawning a new one will overwrite it.
+    local existing_pid
+    existing_pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$session_file" 2>/dev/null || echo "")
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+      spawn=0
+    fi
+  fi
+
+  trap cleanup_spawned_daemon EXIT INT TERM
+
+  if [[ "$spawn" -eq 1 ]]; then
+    # Spawn crit daemon in the background. `--no-open` because nvim is the UI.
+    # Capture stderr so we can surface it if the daemon dies or is slow.
+    local crit_log="/tmp/crit-vim.daemon.$$.log"
+    local crit_args=(--no-open --quiet)
+    # `--base HEAD` explicitly means "unstaged changes" — passing --range
+    # HEAD..HEAD gives an empty diff, which is never what the user wants.
+    # Let crit auto-detect (which prefers unstaged when it exists).
+    if [[ -n "$base" && "$base" != "HEAD" ]]; then
+      crit_args+=(--range "$base..HEAD")
+    fi
+    ( cd "$repo" && crit "${crit_args[@]}" ) >"$crit_log" 2>&1 &
+    CRIT_SPAWNED_PID=$!
+
+    # Wait for the session file to appear (max 60s; large repos + fresh
+    # `crit` cache can take a while to compute the initial diff).
+    local waited=0
+    while [[ ! -f "$session_file" ]] && [[ $waited -lt 600 ]]; do
+      sleep 0.1
+      waited=$((waited + 1))
+      if ! kill -0 "$CRIT_SPAWNED_PID" 2>/dev/null; then
+        echo "crit-vim: crit daemon exited before becoming ready" >&2
+        [[ -s "$crit_log" ]] && { echo "--- crit output ---" >&2; cat "$crit_log" >&2; }
+        rm -f "$crit_log"
+        exit 2
+      fi
+    done
+    if [[ ! -f "$session_file" ]]; then
+      echo "crit-vim: crit daemon did not become ready in 60s" >&2
+      [[ -s "$crit_log" ]] && { echo "--- crit output ---" >&2; cat "$crit_log" >&2; }
+      cleanup_spawned_daemon
+      rm -f "$crit_log"
+      exit 2
+    fi
+    rm -f "$crit_log"
+  fi
+
+  # Read the session entry so nvim knows where to attach.
+  local port host review_path
+  port=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["port"])' "$session_file")
+  host=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("host","127.0.0.1"))' "$session_file")
+  review_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["review_path"])' "$session_file")
+
+  # Wait until /api/session returns 200 (daemon returns 503 while it's still
+  # crawling the working tree). Mirrors tomasz-crit's waitForDaemonReady.
+  local ready_waited=0
+  while [[ $ready_waited -lt 300 ]]; do
+    local code
+    code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 \
+      "http://$host:$port/api/session" 2>/dev/null || echo "000")
+    if [[ "$code" == "200" ]]; then break; fi
+    sleep 0.1
+    ready_waited=$((ready_waited + 1))
+  done
+  [[ $ready_waited -lt 300 ]] || die "crit daemon /api/session never became ready"
+
+  # Optionally open the browser tab too (for parallel review surfaces).
+  if [[ "$no_open_browser" -eq 0 ]]; then
+    (crit --no-open --quiet >/dev/null 2>&1 || true) &
+    local url="http://$host:$port"
+    if command -v open >/dev/null 2>&1; then open "$url" >/dev/null 2>&1 || true
+    elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # Tell nvim to attach. luaeval passes _A verbatim.
+  local args_json
+  args_json=$(python3 -c "
+import json,sys
+print(json.dumps({
+  'port': int(sys.argv[1]),
+  'host': sys.argv[2],
+  'review_path': sys.argv[3],
+  'session_key': sys.argv[4],
+  'scope': sys.argv[5] or None,
+  'base_branch': None,
+}))
+" "$port" "$host" "$review_path" "$key" "$scope")
+
+  # luaeval is finicky about the marshalled string; base64 it.
+  local args_b64
+  args_b64=$(printf '%s' "$args_json" | base64 | tr -d '\n')
+
+  # Guard against a stale plugin load: v0.2.0+ exposes start_review_v2.
+  # If it's missing, the user's nvim is running an older plugin cached from
+  # a previous branch — tell them how to fix it instead of dumping a
+  # `nil value` traceback.
+  local has_v2
+  has_v2=$(nvim_expr "$sock" \
+    "luaeval('(type(require\"crit-vim\".start_review_v2) == \"function\") and 1 or 0')" \
+    || echo 0)
+  if [[ "$has_v2" != "1" ]]; then
+    cat >&2 <<'EOM'
+crit-vim: the running nvim has an older crit-vim plugin loaded.
+  crit-vim 0.2.0+ requires the plugin exposing `start_review_v2`.
+  Fix:
+    - Make sure the plugin dir is on the branch that ships this CLI:
+        git -C <plugin-dir> pull --ff-only
+    - Reload the plugin in nvim (lazy.nvim):  :Lazy reload crit-vim
+      Or just restart nvim.
+EOM
+    exit 2
+  fi
+
+  if ! nvim --headless --server "$sock" --remote-expr \
+        "luaeval('require\"crit-vim\".start_review_v2(vim.json.decode(vim.base64.decode(_A)))', '$args_b64')" \
+        </dev/null >/dev/null 2>/tmp/crit-vim.nvim.err; then
     echo "crit-vim: failed to start review in nvim" >&2
-    cat "$sdir/nvim.err" >&2 || true
-    exec 3<&-
+    cat /tmp/crit-vim.nvim.err >&2 || true
     exit 2
   fi
 
-  if [[ "$wait_for_finish" -eq 0 ]]; then
-    exec 3<&-
-    printf '%s\n' "$sdir"
-    return 0
+  # Block until the review is finished. Poll every 200ms so :CritFinish
+  # → daemon-stop transitions are picked up quickly.
+  local waited_ds=0                       # tenths of a second
+  local timeout_ds=$((timeout * 10))
+  while : ; do
+    # If the daemon PID we spawned is gone, we're done.
+    if [[ -n "$CRIT_SPAWNED_PID" ]] && ! kill -0 "$CRIT_SPAWNED_PID" 2>/dev/null; then
+      CRIT_SPAWNED_PID=""
+      break
+    fi
+    # If session file disappears, daemon shut down.
+    if [[ ! -f "$session_file" ]]; then break; fi
+    # Existing daemon (not ours)? Check the recorded PID.
+    if [[ -z "$CRIT_SPAWNED_PID" ]]; then
+      local pid
+      pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$session_file" 2>/dev/null || echo "")
+      if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then break; fi
+    fi
+    sleep 0.2
+    waited_ds=$((waited_ds + 2))
+    if [[ "$waited_ds" -ge "$timeout_ds" ]]; then
+      echo "crit-vim: timed out after ${timeout}s" >&2
+      cleanup_spawned_daemon
+      exit 124
+    fi
+  done
+
+  # If the nvim plugin wrote the cancel sentinel for THIS session key,
+  # treat the review as cancelled: don't send comments to the agent.
+  local cancel_sentinel="$HOME/.crit-vim/last-cancel"
+  if [[ -f "$cancel_sentinel" ]]; then
+    local cancelled_key
+    cancelled_key=$(cat "$cancel_sentinel" 2>/dev/null || echo "")
+    if [[ -z "$cancelled_key" || "$cancelled_key" == "$key" ]]; then
+      rm -f "$cancel_sentinel"
+      echo "crit-vim: review cancelled" >&2
+      exit 1
+    fi
   fi
 
-  # Block until vim signals.
-  if ! read -r -t "$timeout" -u 3 _line; then
-    echo "crit-vim: timed out after ${timeout}s" >&2
-    nvim --server "$sock" --remote-expr \
-      'luaeval("require\"crit-vim\".cancel()")' >/dev/null 2>&1 || true
-    exec 3<&-
-    exit 124
-  fi
-  exec 3<&-
-
-  local result="ok"
-  [[ -f "$sdir/result" ]] && result=$(cat "$sdir/result")
-
-  if [[ "$result" == "cancel" ]]; then
-    echo "crit-vim: review cancelled" >&2
-    exit 1
-  fi
-  if [[ "$result" == "error" ]]; then
-    echo "crit-vim: review errored in nvim" >&2
-    [[ -f "$sdir/error" ]] && cat "$sdir/error" >&2
-    exit 2
-  fi
-
-  # Remember this session for `crit-vim status`.
-  mkdir -p "$HOME/.crit-vim"
-  printf '%s\n' "$sdir" > "$HOME/.crit-vim/last-finished"
-
-  cat "$sdir/comments.json"
+  # Print the review's comments as JSON. `crit comments --json` prints the
+  # full review-file shape and is stable across versions.
+  ( cd "$repo" && crit comments --json 2>/dev/null ) || {
+    # Fallback: dump the review file directly.
+    [[ -f "$review_path/review.json" ]] && cat "$review_path/review.json"
+  }
 }
 
 # ---------- status ----------
 
 cmd_status() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --code|--json) shift ;;
-      -h|--help) echo "usage: crit-vim status [--code]"; return 0 ;;
-      *) die "unknown option: $1" ;;
-    esac
-  done
-  local last="$HOME/.crit-vim/last-finished"
-  [[ -f "$last" ]] || die "no finished review found"
-  local dir
-  dir=$(cat "$last")
-  [[ -f "$dir/comments.json" ]] || die "stale pointer: $dir"
-  cat "$dir/comments.json"
+  crit status "$@"
 }
 
 # ---------- doctor ----------
 
 cmd_doctor() {
-  echo "crit-vim doctor"
+  # Resolve $0 through any symlinks (~/bin/crit-vim -> repo/bin/crit-vim)
+  # so VERSION (sibling of the *real* script's dir) is found.
+  local script_real self_dir vfile
+  if script_real=$(readlink -f "$0" 2>/dev/null); then :
+  else
+    # macOS `readlink` has no -f; walk manually.
+    script_real="$0"
+    while [[ -L "$script_real" ]]; do
+      local link; link=$(readlink "$script_real")
+      case "$link" in
+        /*) script_real="$link" ;;
+         *) script_real="$(cd "$(dirname "$script_real")" && pwd)/$link" ;;
+      esac
+    done
+  fi
+  self_dir=$(cd "$(dirname "$script_real")/.." 2>/dev/null && pwd)
+  vfile="$self_dir/VERSION"
+  local version="(unknown)"
+  [[ -f "$vfile" ]] && version=$(cat "$vfile" | tr -d '[:space:]')
+  echo "crit-vim doctor (crit-vim $version)"
   echo "  \$NVIM=${NVIM:-(unset)}"
   echo "  \$CRIT_VIM_SOCKET=${CRIT_VIM_SOCKET:-(unset)}"
+  if command -v crit >/dev/null 2>&1; then
+    echo "  crit=$(command -v crit) ($(crit --version 2>&1 | head -1))"
+  else
+    echo "  crit=(not installed — brew install crit)"
+  fi
   local repo
   if repo=$(repo_root); then
     echo "  repo=$repo"
+    local branch sf
+    branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
+    sf=$(crit_session_file "$repo") \
+      || sf=$(session_file_path "$(session_key_for_cwd_branch "$repo" "$branch")")
+    echo "  branch=$branch"
+    if [[ -f "$sf" ]]; then
+      echo "  session_file=$sf (exists)"
+    else
+      echo "  session_file=$sf (absent — no daemon)"
+    fi
     local reg
     reg=$(socket_registry_path "$repo")
     if [[ -f "$reg" ]]; then
-      local s
-      s=$(cat "$reg")
+      local s; s=$(cat "$reg")
       echo "  registry=$reg"
       echo "    socket=$s"
       if nvim_reachable "$s"; then
@@ -283,6 +461,15 @@ cmd_doctor() {
     echo "  → would use: $resolved"
     if nvim_reachable "$resolved"; then
       echo "    reachable: yes"
+      local has_v2
+      has_v2=$(nvim_expr "$resolved" \
+        "luaeval('(type(require\"crit-vim\".start_review_v2) == \"function\") and 1 or 0')" \
+        || echo 0)
+      if [[ "$has_v2" == "1" ]]; then
+        echo "    plugin: 0.2.0+ (has start_review_v2)"
+      else
+        echo "    plugin: OLDER than 0.2.0 — reload with :Lazy reload crit-vim"
+      fi
     else
       echo "    reachable: NO"
     fi
@@ -305,12 +492,13 @@ main() {
 usage: crit-vim <command> [options]
 
 Commands:
-  review   open a review of \`git diff <base>\` in the user's running nvim
-  status   print the JSON of the most recently finished review
-  doctor   diagnose nvim socket discovery
+  review   open a review of the working-tree diff in the user's nvim
+           (delegating session state to \`crit\`, which must be on \$PATH)
+  status   print \`crit status --json\`
+  doctor   diagnose nvim + crit setup
 EOF
       ;;
-    *) die "unknown command: $cmd (try 'crit-vim --help')" ;;
+    *) die "unknown command: $cmd" ;;
   esac
 }
 
