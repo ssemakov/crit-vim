@@ -381,6 +381,13 @@ local function trunc_path_left(p, width)
   return "…" .. p:sub(-(width - 1))
 end
 
+-- Truncate from the RIGHT — for comment previews where the first words
+-- are more informative than the last.
+local function trunc_right(s, width)
+  if vim.fn.strdisplaywidth(s) <= width then return s end
+  return s:sub(1, width - 1) .. "…"
+end
+
 -- Build the sidebar rows and a parallel meta table indexed by row number.
 -- meta[row] describes what action `<CR>` on that row should do:
 --   { kind = "file",   file = "…" }
@@ -456,11 +463,9 @@ local function sidebar_lines()
     local header_text = trunc_path_left(t.path, SIDEBAR_WIDTH - 12)
     push(string.format(" %s:%d%s", header_text, t.line, suffix),
       { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
-    local preview = t.body:gsub("\r?\n.*$", ""):gsub("^%s+", "")
-    preview = trunc_path_left(preview, SIDEBAR_WIDTH - 4):gsub("^…", "")
-    if vim.fn.strdisplaywidth(preview) > SIDEBAR_WIDTH - 4 then
-      preview = preview:sub(1, SIDEBAR_WIDTH - 5) .. "…"
-    end
+    local preview = trunc_right(
+      t.body:gsub("\r?\n.*$", ""):gsub("^%s+", ""),
+      SIDEBAR_WIDTH - 4)
     push("   " .. preview,
       { kind = "thread", file = t.path, line = t.line, comment_id = t.comment_id })
   end
