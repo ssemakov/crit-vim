@@ -62,6 +62,10 @@ return {
       { "<leader>CC", "<Plug>(CritCommentLine)", mode = "n",          desc = "Crit: comment line" },
       { "<leader>Cr", "<Plug>(CritReply)",       mode = "n",          desc = "Crit: reply" },
       { "<leader>Cx", "<Plug>(CritResolve)",     mode = "n",          desc = "Crit: toggle resolve" },
+      { "<leader>Ct", "<Plug>(CritNextThread)",  mode = "n",          desc = "Crit: next unresolved thread" },
+      { "<leader>CT", "<Plug>(CritPrevThread)",  mode = "n",          desc = "Crit: prev unresolved thread" },
+      { "]C",         "<Plug>(CritNextThread)",  mode = "n",          desc = "Crit: next thread" },
+      { "[C",         "<Plug>(CritPrevThread)",  mode = "n",          desc = "Crit: prev thread" },
     },
   },
 }
@@ -120,8 +124,42 @@ Binary files are skipped automatically (detected via a NUL byte in the
 first 8KB of `git show`).
 
 In nvim, one diff tab opens per changed file, with a sidebar on the left
-listing files and comment counts. `<CR>` on a sidebar row jumps to that
-file, `q` closes the sidebar, `R` refreshes.
+listing files and comment counts. Below the file list, the sidebar shows
+two thread sections — unresolved first, then resolved — each entry is
+`path:line` + first-body preview:
+
+```
+── unresolved (3) ─────────────────
+ lua/crit-vim/init.lua
+  :42 · why extract if only one caller?
+  :88 (+1) · nit — extract
+ README.md
+  :12 · this should handle EOF and return…
+── resolved (2) ───────────────────
+ lua/crit-vim/init.lua
+  :120 · fixed in b7f2a1
+```
+
+Threads are grouped by file (path shown once, threads indented). `j`/`k`
+in the sidebar skip section headers and file rows, landing only on
+actionable rows.
+
+Moving the cursor onto a thread row live-previews it — the diff scrolls
+to that line and focus stays in the sidebar, so `j`/`k` continues to
+navigate.
+
+Sidebar keys:
+
+| Key       | Action                                              |
+| --------- | --------------------------------------------------- |
+| `<CR>`    | jump — file row → tab; thread row → line            |
+| `]t` `[t` | next / prev thread in the sidebar                   |
+| `r`       | reply to thread under cursor                        |
+| `x`       | resolve thread                                      |
+| `X`       | unresolve thread                                    |
+| `d`       | delete thread (prompts y/N)                         |
+| `q`       | close sidebar                                       |
+| `R`       | refresh                                             |
 
 ### Authoring comments
 
@@ -237,13 +275,16 @@ you prefer.
 | `<Plug>(CritCommentLine)`     | n     | comment on current line          |
 | `<Plug>(CritReply)`           | n     | reply to comment under cursor    |
 | `<Plug>(CritResolve)`         | n     | toggle resolved                  |
+| `<Plug>(CritThreadList)`      | n     | focus sidebar on unresolved threads |
+| `<Plug>(CritNextThread)`      | n     | jump to next unresolved thread   |
+| `<Plug>(CritPrevThread)`      | n     | jump to previous unresolved thread |
 
 They silently no-op outside an active review, so binding them globally is
 safe. Or shortcut:
 
 ```lua
 require("crit-vim").setup({ default_keys = true })
--- binds <leader>C, <leader>CC, <leader>Cr, <leader>Cx.
+-- binds <leader>C{,C,r,x,t,T} and ]C/[C.
 ```
 
 ## Socket discovery
