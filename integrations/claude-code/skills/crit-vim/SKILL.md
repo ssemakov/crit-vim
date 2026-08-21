@@ -99,23 +99,40 @@ Rules:
 - `side: "old"` (or `"left"`) → comment is on the base — usually a question about a removal.
 - `quote`: verbatim text the user selected — focus edits there.
 
-## Step 3: Address each comment
+## Step 3: Reply to every comment BEFORE editing anything
+
+**Reply first. Edit second. This order is not optional.**
+
+A crit comment is a conversation turn, not a work order. Many are questions
+("is this temp code?", "do we expect that to be nil?") whose answer is an
+explanation, not a diff — and some change requests dissolve once the question
+behind them is answered. Editing first turns the review into a fait accompli:
+the user gets a pile of changes instead of answers, and cannot redirect before
+the work is done.
+
+So, in order:
+
+1. Read every unresolved comment + all its replies.
+2. Gather whatever facts the answers need (read the code, trace callers). Do
+   not edit files during this step.
+3. **Post a reply to every thread** — answer the questions, and for change
+   requests state what you intend to do and anything the user should weigh in
+   on (a rename's new name, a diff that grows beyond the PR's files).
+4. Only then make the edits, and reply again on any thread where what you did
+   differs from what you said you would do.
 
 For each unresolved comment:
 
 1. Read the comment + all replies.
-2. Edit the referenced file with `Edit` / `MultiEdit`.
-3. **Post a reply** so the user knows what you did (recommended):
+2. **Post a reply** answering the question or stating the intended change:
 
     ```bash
     crit comment --reply-to <comment_id> --author 'Claude' 'Extracted into helper; see line 88.'
     ```
 
-    Add `--resolve` to also close the thread in one call:
+3. Edit the referenced file with `Edit` / `MultiEdit`.
 
-    ```bash
-    crit comment --reply-to <comment_id> --resolve --author 'Claude' 'Fixed in this round.'
-    ```
+    Never pass `--resolve`. Resolving a thread is the user's call, not yours.
 
 If there are zero unresolved comments left, the user has approved. Stop and inform them.
 
