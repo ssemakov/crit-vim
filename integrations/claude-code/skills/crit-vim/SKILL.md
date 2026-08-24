@@ -138,15 +138,23 @@ If there are zero unresolved comments left, the user has approved. Stop and info
 
 ## Step 4: Next round
 
-After addressing comments, run `crit-vim review` in the background again. Same repo+branch → same session key → the previous round's comments (and your replies) stay visible alongside the fresh diff.
+Reopening the review is implied by replying. The moment the last reply is posted
+— whether or not any edit followed — run `crit-vim review` in the background
+again. Do not ask whether to reopen it; replies the user cannot see are replies
+that did not happen. Same repo+branch → same session key → the previous round's
+comments and your replies stay visible alongside the fresh diff.
 
 ```bash
 crit-vim review
 ```
 
+If a daemon is already running on the right range (check `crit status --json`),
+attach bare — passing `--base` to a run that does not spawn the daemon makes
+`crit-vim` wait on a session id that never appears.
+
 Tell the user:
 
-> **"Changes applied. `:CritFinish` when ready, or `:CritCancel` if everything looks good."**
+> **"Replies posted. `:CritFinish` when ready, or `:CritCancel` if everything looks good."**
 
 Loop back to Step 2.
 
