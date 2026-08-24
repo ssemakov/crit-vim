@@ -1402,7 +1402,23 @@ local function review_buffer_info()
   return bufnr, side, file
 end
 
+-- Close the comment float and hand focus back to the window the comment was
+-- started from. Without the explicit restore nvim falls back to `firstwin`
+-- (the sidebar) whenever `prevwin` got clobbered while the float was open.
+local function close_comment_buffer(ctx, buf)
+  if ctx and ctx.win and vim.api.nvim_win_is_valid(ctx.win) then
+    pcall(vim.api.nvim_win_close, ctx.win, true)
+  end
+  if vim.api.nvim_buf_is_valid(buf) then
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  end
+  if ctx and ctx.prev_win and vim.api.nvim_win_is_valid(ctx.prev_win) then
+    pcall(vim.api.nvim_set_current_win, ctx.prev_win)
+  end
+end
+
 function open_comment_buffer(ctx)  -- assigns forward-declared local
+  local prev_win = vim.api.nvim_get_current_win()
   local buf = vim.api.nvim_create_buf(false, true)
   -- acwrite + BufWriteCmd so `:w` (and `ZZ`) saves the comment without
   -- needing a real file on disk.
@@ -1440,6 +1456,7 @@ function open_comment_buffer(ctx)  -- assigns forward-declared local
   vim.wo[win].breakindent = true
 
   ctx.win = win
+  ctx.prev_win = prev_win
   M._comment_ctx[buf] = ctx
 
   -- Prefill body when editing.
@@ -1552,12 +1569,7 @@ function M._save_comment_buffer(buf)
   pcall(function() vim.bo[buf].modified = false end)
   vim.schedule(function()
     vim.cmd("stopinsert")
-    if ctx.win and vim.api.nvim_win_is_valid(ctx.win) then
-      pcall(vim.api.nvim_win_close, ctx.win, true)
-    end
-    if vim.api.nvim_buf_is_valid(buf) then
-      pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    end
+    close_comment_buffer(ctx, buf)
   end)
   local kind = ctx.reply_to and "reply"
     or ctx.edit_reply_id and "reply updated"
@@ -1570,12 +1582,7 @@ function M._cancel_comment_buffer(buf)
   local ctx = M._comment_ctx[buf]
   M._comment_ctx[buf] = nil
   vim.cmd("stopinsert")
-  if ctx and ctx.win and vim.api.nvim_win_is_valid(ctx.win) then
-    pcall(vim.api.nvim_win_close, ctx.win, true)
-  end
-  if vim.api.nvim_buf_is_valid(buf) then
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
-  end
+  close_comment_buffer(ctx, buf)
 end
 
 local function file_status_for(file)
