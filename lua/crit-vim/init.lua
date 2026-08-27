@@ -573,7 +573,7 @@ local function file_index_for_tab(tab)
 end
 
 function M._reposition_sidebar_cursor()
-  if not M.session then return end
+  if not M.session or M._previewing then return end
   local tab = vim.api.nvim_get_current_tabpage()
   local idx, fi = file_index_for_tab(tab)
   if not idx or not fi then return end
@@ -694,20 +694,28 @@ function M._sidebar_preview()
   local m = sidebar_thread_at_cursor()
   if not m then return end
   local sidebar_win = vim.api.nvim_get_current_win()
-  jump_to_file_tab(m.file, m.line)
+  local row = vim.api.nvim_win_get_cursor(sidebar_win)[1]
+  -- The sidebar buffer is shared but each tab's sidebar window keeps its
+  -- own cursor, and the tab switch below fires TabEnter, whose handler
+  -- snaps that cursor to the tab's file row. Suppress it and carry `row`
+  -- over, otherwise j/k appears to jump backwards through the list.
+  M._previewing = true
+  pcall(jump_to_file_tab, m.file, m.line)
   local tab = vim.api.nvim_get_current_tabpage()
   -- Find the sidebar window in the (possibly-switched) tab and refocus.
+  local target = sidebar_win
   for _, bufs in pairs(M.session.file_bufs or {}) do
     if bufs.tab == tab and bufs.sidebar_win
        and vim.api.nvim_win_is_valid(bufs.sidebar_win) then
-      pcall(vim.api.nvim_set_current_win, bufs.sidebar_win)
-      return
+      target = bufs.sidebar_win
+      break
     end
   end
-  -- Fallback: same window (only relevant if the tab didn't change).
-  if vim.api.nvim_win_is_valid(sidebar_win) then
-    pcall(vim.api.nvim_set_current_win, sidebar_win)
+  if vim.api.nvim_win_is_valid(target) then
+    pcall(vim.api.nvim_set_current_win, target)
+    pcall(vim.api.nvim_win_set_cursor, target, { row, 0 })
   end
+  M._previewing = false
 end
 
 -- Move cursor to the next row with a non-nil meta entry, in `direction`.
